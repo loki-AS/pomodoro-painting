@@ -1,0 +1,216 @@
+:root {
+  --bg-deep: #14110e;
+  --bg-mid: #2c241c;
+  --bg-wash: #3d3228;
+  --surface: #4a3f33;
+  --ink: #f3ebe0;
+  --ink-muted: #b9aa96;
+  --line: rgba(243, 235, 224, 0.22);
+  --accent: #c45c26;
+  --accent-hot: #d96a2e;
+  --accent-ink: #1a120c;
+  --font-display: 'Cormorant Garamond', Georgia, serif;
+  --font-sans: 'DM Sans', system-ui, sans-serif;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--ink);
+  background: var(--bg-deep);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  color: inherit;
+}
+
+.app {
+  position: relative;
+  min-height: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 90% 70% at 15% 10%, rgba(196, 92, 38, 0.18), transparent 55%),
+    radial-gradient(ellipse 80% 60% at 90% 85%, rgba(70, 90, 110, 0.22), transparent 50%),
+    linear-gradient(165deg, var(--bg-wash) 0%, var(--bg-mid) 42%, var(--bg-deep) 100%);
+}
+
+.app--break {
+  background: #1a1612;
+}
+
+.app__atmosphere {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, transparent 60%, rgba(20, 17, 14, 0.45) 100%),
+    repeating-linear-gradient(
+      -12deg,
+      transparent,
+      transparent 2px,
+      rgba(255, 255, 255, 0.015) 2px,
+      rgba(255, 255, 255, 0.015) 3px
+    );
+  opacity: 1;
+  transition: opacity 0.6s ease;
+  z-index: 0;
+}
+
+.app--break .app__atmosphere {
+  opacity: 0;
+}
+
+.app__main {
+  position: relative;
+  z-index: 2;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1.5rem 6.5rem;
+}
+
+.app__footer {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 1.25rem 1.5rem 1.75rem;
+  background: linear-gradient(180deg, transparent, rgba(20, 17, 14, 0.72) 45%);
+}
+
+.app--break .app__footer {
+  background: linear-gradient(180deg, transparent, rgba(10, 8, 6, 0.78) 50%);
+}
+
+.idle {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 1rem;
+  max-width: 28rem;
+  animation: idle-in 0.9s ease both;
+}
+
+.idle__brand {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(3.2rem, 12vw, 5.5rem);
+  font-weight: 600;
+  line-height: 0.95;
+  letter-spacing: 0.02em;
+}
+
+.idle__tagline {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(1.15rem, 3vw, 1.45rem);
+  font-style: italic;
+  font-weight: 500;
+  color: var(--ink-muted);
+  line-height: 1.35;
+}
+
+.idle__hint {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  color: var(--ink-muted);
+  letter-spacing: 0.04em;
+}
+
+.break-chrome {
+  position: fixed;
+  top: 1.25rem;
+  right: 1.25rem;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.15rem;
+  color: #f4efe6;
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.55);
+  animation: idle-in 0.7s ease both;
+  pointer-events: none;
+}
+
+.break-chrome__status {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 0.72rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: rgba(244, 239, 230, 0.72);
+}
+
+.break-chrome__time {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(1.75rem, 4vw, 2.4rem);
+  font-weight: 500;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.break-chrome__hint {
+  margin: 0.15rem 0 0;
+  font-family: var(--font-sans);
+  font-size: 0.75rem;
+  color: rgba(244, 239, 230, 0.65);
+}
+
+.status-line {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--ink-muted);
+  letter-spacing: 0.04em;
+  min-height: 1.2em;
+}
+
+.status-line--error {
+  color: #e8a090;
+}
+
+@keyframes idle-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.75rem);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

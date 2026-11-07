@@ -17,7 +17,7 @@
  */
 
 export type RGB = [number, number, number]
-export type LayerKind = 'sketch' | 'tone' | 'block' | 'form' | 'refine' | 'detail'
+export type LayerKind = 'sketch' | 'tone' | 'block' | 'form' | 'refine' | 'detail' | 'finish'
 export type StrokeStyle = 'pencil' | 'wash' | 'bristle' | 'dab' | 'edge'
 
 export type Stroke = {
@@ -40,7 +40,7 @@ export type Stroke = {
   hairFill: number
   color: string
   rgb: RGB
-  /** Wet paint the brush picked up from the canvas at touchdown (set while painting) */
+  /** Wet paint the brush picks up at touchdown (from the planner's simulated canvas) */
   pickup: RGB | null
   /** How much picked-up paint mixes into the brush load at the start of the stroke */
   mix: number
@@ -56,6 +56,8 @@ export type Stroke = {
   speed: number
   /** Paint thickness (impasto ridge strength): loose early layers stand proud, fine work is flat */
   relief: number
+  /** Strength of bristle streaks dragged along the stroke */
+  streak: number
 }
 
 export type Phase = { kind: LayerKind; start: number; end: number; t0: number; t1: number }
@@ -96,16 +98,23 @@ function rgbString(c: RGB): string {
   return `rgb(${c[0] | 0}, ${c[1] | 0}, ${c[2] | 0})`
 }
 
-function makeCanvas(w: number, h: number): [HTMLCanvasElement, CanvasRenderingContext2D] {
+/**
+ * Planning canvases are CPU-backed: they are read back for sampling, and the
+ * references are only ever drawn in small bbox pieces, which a CPU canvas does
+ * cheaply everywhere (GPU-backed ones were far slower without a real GPU).
+ */
+function makeCanvas(w: number, h: number, read = true): [HTMLCanvasElement, CanvasRenderingContext2D] {
   const c = document.createElement('canvas')
   c.width = Math.max(1, Math.round(w))
   c.height = Math.max(1, Math.round(h))
-  const ctx = c.getContext('2d', { willReadFrequently: true })
+  const ctx = c.getContext('2d', read ? { willReadFrequently: true } : undefined)
   if (!ctx) throw new Error('2D canvas unavailable')
   return [c, ctx]
 }
 
 export const GESSO_RGB: RGB = [0xe8, 0xdf, 0xd0]
+/** Neutral for soft-light: leaves colour unchanged */
+export const MID_GREY: RGB = [128, 128, 128]
 
 // ---------------------------------------------------------------------------
 // Hand timing (shared with the engine so phase timing matches the real hand)
@@ -139,8 +148,14 @@ export function strokeSec(s: Stroke): number {
 
 type LayerSpec = {
   kind: Exclude<LayerKind, 'sketch'>
-  /** Blur of this layer's reference image */
+  /** Gaussian blur of this layer's reference (for the oil filter: a light pre-blur) */
   sigma: number
+  /**
+   * Oil-paint (Kuwahara) radius for the reference. Flat areas become smooth patches
+   * of colour while edges stay crisp, so strokes carry paint, not photo texture.
+   * 0 = plain blurred reference (the tonal wash).
+   */
+  oil: number
   width: number
   len: [number, number]
   alpha: [number, number]
@@ -150,21 +165,30 @@ type LayerSpec = {
   stopDist: number
   styles: [StrokeStyle, number][]
   tint: number
+  /** Bristle streaks dragged along the stroke (soft-light strength) */
+  streak: number
   mix: number
   speed: number
   /** Share of the stroke budget; cover layers instead paint until nothing is bare */
   share: number
   cover: boolean
+  /** Cover every part of the canvas for certain, regardless of the error estimate */
+  full?: boolean
   /** Dry-brush and ridge texture: strong in loose early layers, near zero in fine work */
   texture: number
+  /** Paint ridge strength when it should differ from `texture` */
+  ridge?: number
 }
 
 const LAYERS: LayerSpec[] = [
-  { kind: 'tone', sigma: 26, width: 110, len: [220, 440], alpha: [0.55, 0.7], threshold: 12, stopDist: Infinity, styles: [['wash', 1]], tint: 0.15, mix: 0, speed: 640, share: 0, cover: true, texture: 1 },
-  { kind: 'block', sigma: 12, width: 46, len: [90, 260], alpha: [0.94, 0.99], threshold: 10, stopDist: 48, styles: [['bristle', 0.7], ['wash', 0.3]], tint: 0.12, mix: 0.25, speed: 480, share: 0, cover: true, texture: 0.5 },
-  { kind: 'form', sigma: 4, width: 24, len: [40, 150], alpha: [0.9, 0.98], threshold: 13, stopDist: 38, styles: [['bristle', 0.75], ['dab', 0.25]], tint: 0.07, mix: 0.2, speed: 380, share: 0.3, cover: false, texture: 0.45 },
-  { kind: 'refine', sigma: 1.5, width: 13, len: [18, 80], alpha: [0.93, 1], threshold: 16, stopDist: 30, styles: [['bristle', 0.55], ['edge', 0.45]], tint: 0.04, mix: 0.12, speed: 300, share: 0.33, cover: false, texture: 0.2 },
-  { kind: 'detail', sigma: 0, width: 7, len: [8, 40], alpha: [0.95, 1], threshold: 18, stopDist: 26, styles: [['edge', 0.7], ['bristle', 0.3]], tint: 0.02, mix: 0.05, speed: 220, share: 0.37, cover: false, texture: 0.08 },
+  { kind: 'tone', sigma: 26, oil: 0, width: 110, len: [220, 440], alpha: [0.55, 0.7], threshold: 12, stopDist: Infinity, styles: [['wash', 1]], tint: 0.15, streak: 0.3, mix: 0, speed: 640, share: 0, cover: true, texture: 1 },
+  { kind: 'block', sigma: 2, oil: 12, width: 46, len: [90, 260], alpha: [0.94, 0.99], threshold: 10, stopDist: 48, styles: [['bristle', 0.75], ['wash', 0.25]], tint: 0.1, streak: 0.6, mix: 0.25, speed: 480, share: 0, cover: true, texture: 0.5 },
+  { kind: 'form', sigma: 1, oil: 6, width: 24, len: [40, 150], alpha: [0.9, 0.98], threshold: 13, stopDist: 38, styles: [['bristle', 0.8], ['dab', 0.2]], tint: 0.06, streak: 0.5, mix: 0.2, speed: 380, share: 0.3, cover: false, texture: 0.35 },
+  { kind: 'refine', sigma: 0, oil: 3.5, width: 13, len: [18, 80], alpha: [0.93, 1], threshold: 16, stopDist: 30, styles: [['bristle', 0.7], ['edge', 0.3]], tint: 0.04, streak: 0.4, mix: 0.12, speed: 300, share: 0.33, cover: false, texture: 0.15 },
+  { kind: 'detail', sigma: 0, oil: 2, width: 7, len: [8, 40], alpha: [0.95, 1], threshold: 18, stopDist: 26, styles: [['edge', 0.6], ['bristle', 0.4]], tint: 0.02, streak: 0.3, mix: 0.05, speed: 220, share: 0.37, cover: false, texture: 0.05 },
+  // Final pass: a fine-oil brush worked over the whole canvas, so the piece always
+  // ends neat and complete — but as paint (streaks, a slight ridge), never a photo
+  { kind: 'finish', sigma: 0, oil: 2, width: 64, len: [150, 340], alpha: [1, 1], threshold: 0, stopDist: 70, styles: [['bristle', 1]], tint: 0.05, streak: 0.35, mix: 0, speed: 520, share: 0, cover: true, full: true, texture: 0, ridge: 0.25 },
 ]
 
 function pickStyle(styles: [StrokeStyle, number][]): StrokeStyle {
@@ -185,38 +209,56 @@ function supportsFilter(): boolean {
   return ctx.filter === 'blur(2px)'
 }
 
-/** The image blurred by `sigma`, with edges extended so borders don't fade out. */
-function makeRef(source: HTMLCanvasElement, W: number, H: number, sigma: number, filterOk: boolean): HTMLCanvasElement {
+/**
+ * The image blurred by `sigma`, with edges extended so borders don't fade out.
+ * Big blurs are computed on a downscaled copy (looks identical, a fraction of the
+ * work) and the tonal underpainting is coloured there too.
+ */
+function makeRef(
+  source: HTMLCanvasElement,
+  W: number,
+  H: number,
+  sigma: number,
+  filterOk: boolean,
+  tone = false,
+): HTMLCanvasElement {
   const [out, ctx] = makeCanvas(W, H)
-  if (sigma <= 0.5) {
+  if (sigma <= 0.5 && !tone) {
     ctx.drawImage(source, 0, 0)
     return out
   }
-  const pad = Math.ceil(sigma * 3) + 2
-  const [padded, pctx] = makeCanvas(W + pad * 2, H + pad * 2)
-  pctx.drawImage(source, 0, 0, W + pad * 2, H + pad * 2)
-  pctx.drawImage(source, pad, pad)
+  const k = clamp(sigma / 2, 1, 8)
+  const pad = Math.ceil((sigma * 3) / k) + 2
+  const sw = Math.max(1, Math.round(W / k))
+  const sh = Math.max(1, Math.round(H / k))
+  const [padded, pctx] = makeCanvas(sw + pad * 2, sh + pad * 2)
+  pctx.imageSmoothingQuality = 'high'
+  pctx.drawImage(source, 0, 0, padded.width, padded.height)
+  pctx.drawImage(source, pad, pad, sw, sh)
 
+  const [small, sctx] = makeCanvas(sw, sh, true)
   if (filterOk) {
-    ctx.filter = `blur(${sigma.toFixed(1)}px)`
-    ctx.drawImage(padded, -pad, -pad)
-    ctx.filter = 'none'
+    sctx.filter = `blur(${(sigma / k).toFixed(2)}px)`
+    sctx.drawImage(padded, -pad, -pad)
+    sctx.filter = 'none'
   } else {
-    // Downscale/upscale blur for browsers without ctx.filter
-    const k = Math.max(1, sigma / 1.2)
-    const [small, sctx] = makeCanvas((W + pad * 2) / k, (H + pad * 2) / k)
+    // Further downscale/upscale for browsers without ctx.filter
+    const k2 = Math.max(1, sigma / k / 1.2)
+    const [tiny, tctx] = makeCanvas(padded.width / k2, padded.height / k2)
+    tctx.imageSmoothingQuality = 'high'
+    tctx.drawImage(padded, 0, 0, tiny.width, tiny.height)
     sctx.imageSmoothingQuality = 'high'
-    sctx.drawImage(padded, 0, 0, small.width, small.height)
-    ctx.imageSmoothingQuality = 'high'
-    ctx.drawImage(small, -pad, -pad, W + pad * 2, H + pad * 2)
+    sctx.drawImage(tiny, -pad, -pad, padded.width, padded.height)
   }
+  if (tone) toneInPlace(sctx, sw, sh)
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(small, 0, 0, W, H)
   return out
 }
 
 /** Warm, mostly monochrome version for the tonal underpainting (burnt-umber wash). */
-function toneInPlace(c: HTMLCanvasElement): void {
-  const ctx = c.getContext('2d')!
-  const img = ctx.getImageData(0, 0, c.width, c.height)
+function toneInPlace(ctx: CanvasRenderingContext2D, w: number, h: number): void {
+  const img = ctx.getImageData(0, 0, w, h)
   const d = img.data
   for (let i = 0; i < d.length; i += 4) {
     const l = 0.299 * d[i]! + 0.587 * d[i + 1]! + 0.114 * d[i + 2]!
@@ -227,8 +269,124 @@ function toneInPlace(c: HTMLCanvasElement): void {
   ctx.putImageData(img, 0, 0)
 }
 
+/**
+ * Kuwahara oil-paint filter. For each pixel, look at the four overlapping
+ * (r+1)×(r+1) quadrants around it and take the mean colour of the calmest one.
+ * Smooth areas flatten into patches of colour; edges stay sharp, because the
+ * quadrant that doesn't straddle the edge always wins. Box sums keep it O(n).
+ */
+function kuwahara(src: Uint8ClampedArray, w: number, h: number, r: number): Uint8ClampedArray {
+  const n = w * h
+  const span = r + 1
+  const area = span * span
+  const val = new Float32Array(n)
+  const tmp = new Float32Array(n)
+
+  // Window sums anchored at the top-left: S(x, y) = Σ v over [x, x+r] × [y, y+r]
+  // Interior runs need no edge clamping; only the last `span` steps of each run do
+  const boxSum = (v: Float32Array, out: Float32Array) => {
+    const xEnd = Math.max(0, w - span)
+    for (let y = 0; y < h; y++) {
+      const row = y * w
+      let acc = 0
+      for (let k = 0; k < span; k++) acc += v[row + Math.min(w - 1, k)]!
+      let x = 0
+      for (; x < xEnd; x++) {
+        tmp[row + x] = acc
+        acc += v[row + x + span]! - v[row + x]!
+      }
+      const edge = v[row + w - 1]!
+      for (; x < w; x++) {
+        tmp[row + x] = acc
+        acc += edge - v[row + x]!
+      }
+    }
+    // Columns, processed row by row for cache-friendly access
+    for (let x = 0; x < w; x++) out[x] = 0
+    for (let k = 0; k < span; k++) {
+      const row = Math.min(h - 1, k) * w
+      for (let x = 0; x < w; x++) out[x] = out[x]! + tmp[row + x]!
+    }
+    const last = (h - 1) * w
+    for (let y = 1; y < h; y++) {
+      const cur = y * w
+      const prev = cur - w
+      const addRow = Math.min(h - 1, y - 1 + span) * w
+      const subRow = (y - 1) * w
+      if (addRow === last) {
+        for (let x = 0; x < w; x++) out[cur + x] = out[prev + x]! + tmp[last + x]! - tmp[subRow + x]!
+      } else {
+        for (let x = 0; x < w; x++) out[cur + x] = out[prev + x]! + tmp[addRow + x]! - tmp[subRow + x]!
+      }
+    }
+  }
+
+  // 1) Pick each pixel's calmest quadrant from brightness alone
+  const sumL = new Float32Array(n)
+  const sumL2 = new Float32Array(n)
+  for (let i = 0; i < n; i++) val[i] = 0.299 * src[i * 4]! + 0.587 * src[i * 4 + 1]! + 0.114 * src[i * 4 + 2]!
+  boxSum(val, sumL)
+  for (let i = 0; i < n; i++) val[i] = val[i]! * val[i]!
+  boxSum(val, sumL2)
+  const best = new Int32Array(n)
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let bestVar = Infinity
+      let bi = 0
+      for (let q = 0; q < 4; q++) {
+        const j = (q & 2 ? y : Math.max(0, y - r)) * w + (q & 1 ? x : Math.max(0, x - r))
+        const m = sumL[j]! / area
+        const v = sumL2[j]! / area - m * m
+        if (v < bestVar) {
+          bestVar = v
+          bi = j
+        }
+      }
+      best[y * w + x] = bi
+    }
+  }
+
+  // 2) Average each colour channel over the chosen quadrant, one channel at a time
+  const dst = new Uint8ClampedArray(n * 4)
+  for (let c = 0; c < 3; c++) {
+    for (let i = 0; i < n; i++) val[i] = src[i * 4 + c]!
+    boxSum(val, sumL) // reuse buffer
+    for (let i = 0; i < n; i++) dst[i * 4 + c] = sumL[best[i]!]! / area
+  }
+  for (let i = 0; i < n; i++) dst[i * 4 + 3] = 255
+  return dst
+}
+
+/**
+ * The image as a painter would render it at a given brush scale: oil-filtered at
+ * `radius` px. Large radii run on a downscaled copy (same look, a fraction of the work).
+ */
+function makePainterly(
+  source: HTMLCanvasElement,
+  W: number,
+  H: number,
+  radius: number,
+  preBlur: number,
+  filterOk: boolean,
+): HTMLCanvasElement {
+  const k = Math.max(1, radius / 3)
+  const r = Math.max(1, Math.round(radius / k))
+  const [small, sctx] = makeCanvas(W / k, H / k, true)
+  sctx.imageSmoothingQuality = 'high'
+  if (preBlur > 0.5 && filterOk) sctx.filter = `blur(${(preBlur / k).toFixed(1)}px)`
+  sctx.drawImage(source, 0, 0, small.width, small.height)
+  sctx.filter = 'none'
+  const img = sctx.getImageData(0, 0, small.width, small.height)
+  img.data.set(kuwahara(img.data, small.width, small.height, r))
+  sctx.putImageData(img, 0, 0)
+  const [out, ctx] = makeCanvas(W, H)
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(small, 0, 0, W, H)
+  return out
+}
+
 function toSample(c: HTMLCanvasElement, sw: number, sh: number): Uint8ClampedArray {
-  const [, ctx] = makeCanvas(sw, sh)
+  const [, ctx] = makeCanvas(sw, sh, true)
   ctx.imageSmoothingQuality = 'high'
   ctx.drawImage(c, 0, 0, sw, sh)
   return ctx.getImageData(0, 0, sw, sh).data
@@ -384,7 +542,7 @@ function buildStroke(
   points: { x: number; y: number }[],
   width: number,
   rgb: RGB,
-  o: Pick<Stroke, 'alpha' | 'kind' | 'style' | 'level' | 'tint' | 'mix' | 'dry' | 'speed' | 'relief'>,
+  o: Pick<Stroke, 'alpha' | 'kind' | 'style' | 'level' | 'tint' | 'mix' | 'dry' | 'speed' | 'relief' | 'streak'>,
 ): Stroke {
   const { cum, normals } = geometry(points)
   const hairs = o.style === 'bristle' ? clamp(Math.round(width / 5), 3, 9) : 1
@@ -413,7 +571,11 @@ function buildStroke(
       h: Math.max(1, Math.min(c.H, Math.ceil(y1 + pad)) - by),
     },
     baseWidth: width,
-    hairRgb: Array.from({ length: hairs }, () => shade(rgb, rand(-10, 10))),
+    // Paint strokes keep their hairs as grey streak values (applied as soft light over
+    // the stroke's colour); flat pencil keeps real colours
+    hairRgb: Array.from({ length: hairs }, () =>
+      o.level >= 0 ? shade(MID_GREY, hairs > 1 ? rand(-30, 30) : 0) : shade(rgb, rand(-10, 10)),
+    ),
     hairEnd: Array.from({ length: hairs }, () => (Math.random() < 0.65 ? 1 : rand(0.86, 0.98))),
     hairFill: o.level >= 0 ? 0.985 : 1.04,
     color: rgbString(rgb),
@@ -512,7 +674,8 @@ function traceStroke(c: PlanCtx, L: LayerSpec, level: number, ref: Uint8ClampedA
     // Dry-brush texture belongs to the loose early layers; fine work is smooth
     dry: L.texture * (style === 'edge' ? 0 : style === 'wash' ? rand(0.3, 0.5) : style === 'dab' ? rand(0.08, 0.25) : rand(0.1, 0.4)),
     speed: L.speed * c.s,
-    relief: L.texture,
+    relief: L.ridge ?? L.texture,
+    streak: L.streak,
   })
 }
 
@@ -520,11 +683,27 @@ function traceStroke(c: PlanCtx, L: LayerSpec, level: number, ref: Uint8ClampedA
 // Simulated canvas: where is the painting still wrong?
 // ---------------------------------------------------------------------------
 
+/** Colour already painted at sample index i, or null where the canvas is still bare. */
+function paintUnder(virtual: Float32Array, i: number): RGB | null {
+  const rgb: RGB = [virtual[i * 3]!, virtual[i * 3 + 1]!, virtual[i * 3 + 2]!]
+  const bare =
+    Math.abs(rgb[0] - GESSO_RGB[0]) + Math.abs(rgb[1] - GESSO_RGB[1]) + Math.abs(rgb[2] - GESSO_RGB[2]) < 12
+  return bare ? null : rgb
+}
+
 /** Rasterise a stroke's footprint into the simulated canvas, blending toward its reference. */
-function stamp(c: PlanCtx, virtual: Float32Array, ref: Uint8ClampedArray, st: Stroke): void {
+function stamp(
+  c: PlanCtx,
+  virtual: Float32Array,
+  ref: Uint8ClampedArray,
+  st: Stroke,
+  covered: Uint8Array | null = null,
+): void {
   // Conservative: tapered ends and dry-brush gaps cover less than the full width
   const a = st.alpha * (1 - st.dry * 0.8)
   const r = Math.max(0.6, st.baseWidth * 0.34 * c.ss)
+  // Certain coverage only inside the narrowest (touchdown) width of the stroke
+  const rc = st.baseWidth * 0.3 * c.ss
   for (const p of st.points) {
     const cx = p.x * c.ss
     const cy = p.y * c.ss
@@ -534,8 +713,10 @@ function stamp(c: PlanCtx, virtual: Float32Array, ref: Uint8ClampedArray, st: St
     const x1 = Math.min(c.sw - 1, Math.ceil(cx + r))
     for (let y = y0; y <= y1; y++) {
       for (let x = x0; x <= x1; x++) {
-        if ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 > r * r) continue
+        const d2 = (x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2
+        if (d2 > r * r) continue
         const i = y * c.sw + x
+        if (covered && d2 <= rc * rc) covered[i] = 1
         const k = i * 3
         const j = i * 4
         // Repeated stamps along the path converge to the reference, never overshoot
@@ -584,11 +765,35 @@ function planLayer(
     return { mean: n ? sum / n : 0, worst }
   }
 
+  // The finishing pass ignores error estimates and covers every cell for certain,
+  // so the result is clean even where the simulation was optimistic
+  const covered = L.full ? new Uint8Array(sw * sh) : null
+  const uncoveredIn = (col: number, row: number): number => {
+    let best = -1
+    let bestE = -1
+    for (let y = row * cell; y < Math.min(sh, (row + 1) * cell); y++) {
+      for (let x = col * cell; x < Math.min(sw, (col + 1) * cell); x++) {
+        const i = y * sw + x
+        if (covered![i]) continue
+        const e = Math.hypot(
+          virtual[i * 3]! - ref[i * 4]!,
+          virtual[i * 3 + 1]! - ref[i * 4 + 1]!,
+          virtual[i * 3 + 2]! - ref[i * 4 + 2]!,
+        )
+        if (e > bestE) {
+          bestE = e
+          best = i
+        }
+      }
+    }
+    return best
+  }
+
   const candidates: { col: number; row: number; err: number }[] = []
   for (let row = 0; row < rows; row++) {
     for (let col = 0; col < cols; col++) {
       const { mean } = errorOf(col, row)
-      if (mean > L.threshold) candidates.push({ col, row, err: mean * rand(0.9, 1.1) })
+      if (covered || mean > L.threshold) candidates.push({ col, row, err: mean * rand(0.9, 1.1) })
     }
   }
   // Fix the most-wrong places first; later candidates may already be covered
@@ -597,12 +802,21 @@ function planLayer(
   const out: Stroke[] = []
   for (const cand of candidates) {
     if (out.length >= limit) break
-    const { mean, worst } = errorOf(cand.col, cand.row)
-    if (mean <= L.threshold) continue
-    const x = ((worst % sw) + 0.5) / c.ss
-    const y = (Math.floor(worst / sw) + 0.5) / c.ss
+    let start: number
+    if (covered) {
+      start = uncoveredIn(cand.col, cand.row)
+      if (start < 0) continue
+    } else {
+      const { mean, worst } = errorOf(cand.col, cand.row)
+      if (mean <= L.threshold) continue
+      start = worst
+    }
+    const x = ((start % sw) + 0.5) / c.ss
+    const y = (Math.floor(start / sw) + 0.5) / c.ss
     const st = traceStroke(c, L, level, ref, x, y)
-    stamp(c, virtual, ref, st)
+    // Wet paint the brush will pick up: whatever the simulated canvas holds here now
+    st.pickup = paintUnder(virtual, start)
+    stamp(c, virtual, ref, st, covered)
     out.push(st)
   }
   return out
@@ -786,6 +1000,7 @@ function planSketch(c: PlanCtx, sharp: Uint8ClampedArray, count: number): Stroke
       dry: 0.45,
       speed: 420 * c.s,
       relief: 0,
+      streak: 0,
     })
   })
 
@@ -801,23 +1016,55 @@ function planSketch(c: PlanCtx, sharp: Uint8ClampedArray, count: number): Stroke
 // The whole plan
 // ---------------------------------------------------------------------------
 
-export function planPainting(
+/** Let the browser render a frame between heavy planning steps. */
+function yieldToUI(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
+/**
+ * Plan the whole painting. Runs in small steps, yielding between them so the page
+ * stays responsive; it is meant to run ahead of time (during the focus session).
+ * Returns null if `cancelled()` turns true part-way.
+ */
+export async function planPainting(
   source: HTMLCanvasElement,
   W: number,
   H: number,
   breakSeconds: number,
-): PaintPlan {
+  cancelled: () => boolean = () => false,
+): Promise<PaintPlan | null> {
   const s = Math.min(W, H) / 800
   const sw = Math.max(1, Math.round(Math.min(640, W)))
   const sh = Math.max(1, Math.round((H / W) * sw))
+  const tm: [string, number][] = [['start', performance.now()]]
+  const mark = (label: string) => tm.push([label, performance.now()])
   const filterOk = supportsFilter()
 
-  const refs = LAYERS.map((L) => makeRef(source, W, H, L.sigma * s, filterOk))
-  toneInPlace(refs[0]!)
+  // Each stage paints from the image as rendered at its brush scale (shared when equal)
+  const cache = new Map<string, HTMLCanvasElement>()
+  const refs: HTMLCanvasElement[] = []
+  for (const L of LAYERS) {
+    const key = `${L.oil}|${L.sigma}`
+    let ref = cache.get(key)
+    if (!ref) {
+      ref = L.oil > 0
+        ? makePainterly(source, W, H, L.oil * s, L.sigma * s, filterOk)
+        : makeRef(source, W, H, L.sigma * s, filterOk, L.kind === 'tone')
+      cache.set(key, ref)
+      await yieldToUI()
+      if (cancelled()) return null
+    }
+    refs.push(ref)
+  }
+  mark('refs')
   const samples = refs.map((r) => toSample(r, sw, sh))
   const sharp = toSample(source, sw, sh)
+  mark('samples')
+  await yieldToUI()
+  if (cancelled()) return null
 
   const c: PlanCtx = { W, H, s, sw, sh, ss: sw / W, field: buildField(sharp, sw, sh) }
+  mark('field')
 
   const strokes: Stroke[] = []
   const phases: Phase[] = []
@@ -828,22 +1075,32 @@ export function planPainting(
   }
 
   push('sketch', planSketch(c, sharp, clamp(Math.round(breakSeconds * 0.5), 40, 300)))
+  mark('sketch')
+  await yieldToUI()
+  if (cancelled()) return null
 
   // Simulated canvas starts as bare gesso
   const virtual = new Float32Array(sw * sh * 3)
   for (let i = 0; i < sw * sh; i++) virtual.set(GESSO_RGB, i * 3)
 
-  // ~5.5 strokes/sec of refinement keeps the hand near natural speed
-  const budget = clamp(Math.round(breakSeconds * 5.5), 700, 6000)
-  LAYERS.forEach((L, level) => {
+  // ~3.5 strokes/sec of refinement (plus the finishing pass) keeps the hand near natural speed
+  const budget = clamp(Math.round(breakSeconds * 3.5), 500, 4000)
+  for (let level = 0; level < LAYERS.length; level++) {
+    const L = LAYERS[level]!
     const limit = L.cover ? 4000 : Math.round(budget * L.share)
     const raw = planLayer(c, L, level, samples[level]!, virtual, limit)
     const last = strokes[strokes.length - 1]
     const from = last ? last.points[last.points.length - 1]! : { x: W / 2, y: H / 2 }
     push(L.kind, orderStrokes(raw, from))
-  })
+    await yieldToUI()
+    if (cancelled()) return null
+  }
+  mark('layers')
 
   timePhases(phases, strokes, { x: W * 0.95, y: H * 1.1 })
+  if (import.meta.env.DEV) {
+    console.info('[paint] timings ' + tm.slice(1).map(([l, t], i) => `${l}:${Math.round(t - tm[i]![1])}ms`).join(' '))
+  }
   return { strokes, phases, refs }
 }
 

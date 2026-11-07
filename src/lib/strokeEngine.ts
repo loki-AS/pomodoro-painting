@@ -1,5 +1,5 @@
 import {
-  GESSO_RGB,
+  MID_GREY,
   clamp,
   downSec,
   lerp,
@@ -76,20 +76,16 @@ export type StrokeEngine = {
   strokeLayer: HTMLCanvasElement
   strokeCtx: CanvasRenderingContext2D
   activeStroke: Stroke | null
-  /** Scratch layer for composing a stroke (reference, tint, dry-brush mask) */
+  /** The wet stroke, fully composed (reference, streaks, tint, dry-brush), built up piece by piece */
   scratch: HTMLCanvasElement
   scratchCtx: CanvasRenderingContext2D
   /** Alpha mask of canvas-weave peaks (dry paint skips these) */
   weave: CanvasPattern | null
-  /** Faint shading of the weave valleys, laid over the whole picture */
-  relief: CanvasPattern | null
-  /** Small CPU copy of the paint layer for reading the wet paint under the brush */
-  mirrorCtx: CanvasRenderingContext2D
-  mirrorW: number
-  mirrorH: number
-  mirrorAge: number
-  /** ctx.filter is supported (impasto edges need it) */
-  filters: boolean
+  /** Scratch for the paint-ridge silhouettes */
+  shade: HTMLCanvasElement
+  shadeCtx: CanvasRenderingContext2D
+  /** Canvas-weave shading tile as a data URL, laid over the picture with CSS */
+  reliefUrl: string | null
   width: number
   height: number
   brush: BrushPose
@@ -182,12 +178,13 @@ function makeWeaveTiles(): { mask: HTMLCanvasElement; shade: HTMLCanvasElement }
  * Build the engine: fit the image to the screen, plan the whole painting (sketch
  * through detail), and prepare the layers the hand paints into.
  */
-export function createStrokeEngine(
+export async function createStrokeEngine(
   image: HTMLImageElement,
   canvasWidth: number,
   canvasHeight: number,
   breakSeconds = 15 * 60,
-): StrokeEngine {
+  cancelled: () => boolean = () => false,
+): Promise<StrokeEngine | null> {
   const source = document.createElement('canvas')
   source.width = canvasWidth
   source.height = canvasHeight
@@ -201,7 +198,8 @@ export function createStrokeEngine(
   sctx.fillRect(0, 0, canvasWidth, canvasHeight)
   sctx.drawImage(image, (canvasWidth - dw) / 2, (canvasHeight - dh) / 2, dw, dh)
 
-  const plan = planPainting(source, canvasWidth, canvasHeight, breakSeconds)
+  const plan = await planPainting(source, canvasWidth, canvasHeight, breakSeconds, cancelled)
+  if (!plan) return null
 
   const layer = (opts?: CanvasRenderingContext2DSettings) => {
     const c = document.createElement('canvas')
@@ -217,21 +215,11 @@ export function createStrokeEngine(
   paintCtx.fillRect(0, 0, canvasWidth, canvasHeight)
   const [strokeLayer, strokeCtx] = layer()
   const [scratch, scratchCtx] = layer()
-
-  const mirrorW = 192
-  const mirrorH = Math.max(1, Math.round((canvasHeight / canvasWidth) * mirrorW))
-  const mirror = document.createElement('canvas')
-  mirror.width = mirrorW
-  mirror.height = mirrorH
-  const mirrorCtx = mirror.getContext('2d', { willReadFrequently: true })
-  if (!mirrorCtx) throw new Error('Could not create paint mirror')
+  const [shade, shadeCtx] = layer()
 
   const weaveTiles = makeWeaveTiles()
   const weave = weaveTiles ? strokeCtx.createPattern(weaveTiles.mask, 'repeat') : null
-  const relief = weaveTiles ? strokeCtx.createPattern(weaveTiles.shade, 'repeat') : null
-  strokeCtx.filter = 'brightness(0)'
-  const filters = strokeCtx.filter === 'brightness(0)'
-  strokeCtx.filter = 'none'
+  const reliefUrl = weaveTiles ? weaveTiles.shade.toDataURL() : null
 
   return {
     strokes: plan.strokes,
@@ -245,12 +233,9 @@ export function createStrokeEngine(
     scratch,
     scratchCtx,
     weave,
-    relief,
-    mirrorCtx,
-    mirrorW,
-    mirrorH,
-    mirrorAge: 0,
-    filters,
+    shade,
+    shadeCtx,
+    reliefUrl,
     width: canvasWidth,
     height: canvasHeight,
     pathCursor: 0,
@@ -400,7 +385,7 @@ function paintSegment(
   const tMid = (stroke.cum[i0]! + stroke.cum[i1]!) / 2 / stroke.length
 
   ctx.save()
-  ctx.fillStyle = wetColor(stroke, stroke.rgb, tMid)
+  ctx.fillStyle = wetColor(stroke, stroke.level >= 0 ? MID_GREY : stroke.rgb, tMid)
 
   if (stroke.style === 'bristle') {
     // Parallel hair tracks, each its own shade; some run dry before the end
@@ -436,31 +421,19 @@ function paintSegment(
  */
 function wetColor(stroke: Stroke, base: RGB, t: number): string {
   const p = stroke.pickup
-  if (!p || stroke.mix <= 0) return `rgb(${base[0]}, ${base[1]}, ${base[2]})`
+  // Paint strokes draw grey streak values on the stroke layer (their colour comes
+  // from the painterly reference), so only flat strokes mix in picked-up paint
+  if (!p || stroke.mix <= 0 || stroke.level >= 0) return `rgb(${base[0]}, ${base[1]}, ${base[2]})`
   const f = stroke.mix * (1 - smoothstep(0, 0.6, t))
   return `rgb(${lerp(base[0], p[0], f) | 0}, ${lerp(base[1], p[1], f) | 0}, ${lerp(base[2], p[2], f) | 0})`
 }
 
 
-/** Colour of the wet paint already on the canvas under (x, y), or null on bare gesso. */
-function pickupAt(engine: StrokeEngine, x: number, y: number): RGB | null {
-  // Refresh the small CPU copy every few strokes; one readback is cheap, hundreds aren't
-  if (engine.mirrorAge++ % 6 === 0) {
-    engine.mirrorCtx.drawImage(engine.paintLayer, 0, 0, engine.mirrorW, engine.mirrorH)
-  }
-  const mx = clamp(Math.floor((x / engine.width) * engine.mirrorW), 0, engine.mirrorW - 1)
-  const my = clamp(Math.floor((y / engine.height) * engine.mirrorH), 0, engine.mirrorH - 1)
-  const d = engine.mirrorCtx.getImageData(mx, my, 1, 1).data
-  const rgb: RGB = [d[0]!, d[1]!, d[2]!]
-  const bare =
-    Math.abs(rgb[0] - GESSO_RGB[0]) + Math.abs(rgb[1] - GESSO_RGB[1]) + Math.abs(rgb[2] - GESSO_RGB[2]) < 12
-  return bare ? null : rgb
-}
 
 /** Loaded tip touching the canvas at the start of a stroke. */
 function dropBlotch(ctx: CanvasRenderingContext2D, stroke: Stroke): void {
   ctx.save()
-  ctx.fillStyle = wetColor(stroke, stroke.rgb, 0)
+  ctx.fillStyle = wetColor(stroke, stroke.level >= 0 ? MID_GREY : stroke.rgb, 0)
   endCap(ctx, stroke, 0, stroke.style === 'edge' ? 0.85 : 1)
   ctx.restore()
 }
@@ -469,11 +442,81 @@ function dropBlotch(ctx: CanvasRenderingContext2D, stroke: Stroke): void {
 function beginStrokePaint(engine: StrokeEngine, stroke: Stroke): void {
   const { x, y, w, h } = stroke.bbox
   engine.strokeCtx.clearRect(x, y, w, h)
+  engine.scratchCtx.clearRect(x, y, w, h)
   engine.activeStroke = stroke
   engine.pathCursor = 0
-  const p0 = stroke.points[0]!
-  stroke.pickup = pickupAt(engine, p0.x, p0.y)
   dropBlotch(engine.strokeCtx, stroke)
+  composeArea(engine, stroke, 0, 0)
+}
+
+/**
+ * Compose the finished look of the wet stroke (painterly reference through the
+ * brush mask, bristle streaks, the brush's own tint, dry-brush weave) into the
+ * scratch layer — but only around points i0..i1, the part just painted. Every step
+ * is per-pixel, so composing piece by piece gives exactly the full-stroke result
+ * while keeping each frame cheap.
+ */
+function composeArea(engine: StrokeEngine, stroke: Stroke, i0: number, i1: number): void {
+  const pad = stroke.baseWidth * 0.75 + 4
+  let x0 = Infinity
+  let y0 = Infinity
+  let x1 = -Infinity
+  let y1 = -Infinity
+  for (let i = Math.max(0, i0); i <= Math.min(stroke.points.length - 1, i1); i++) {
+    const p = stroke.points[i]!
+    x0 = Math.min(x0, p.x)
+    y0 = Math.min(y0, p.y)
+    x1 = Math.max(x1, p.x)
+    y1 = Math.max(y1, p.y)
+  }
+  const b = stroke.bbox
+  const x = Math.max(b.x, Math.floor(x0 - pad))
+  const y = Math.max(b.y, Math.floor(y0 - pad))
+  const w = Math.min(b.x + b.w, Math.ceil(x1 + pad)) - x
+  const h = Math.min(b.y + b.h, Math.ceil(y1 + pad)) - y
+  if (w <= 0 || h <= 0) return
+
+  const ref = stroke.level >= 0 ? engine.refs[stroke.level] : undefined
+  const sc = engine.scratchCtx
+  sc.save()
+  // Clip to this piece: modes like destination-in otherwise wipe the whole canvas
+  // outside the drawn image, erasing the parts of the stroke composed earlier
+  sc.beginPath()
+  sc.rect(x, y, w, h)
+  sc.clip()
+  sc.clearRect(x, y, w, h)
+  if (ref) {
+    // The stroke carries the painterly image at this stage's brush scale...
+    sc.drawImage(ref, x, y, w, h, x, y, w, h)
+    sc.globalCompositeOperation = 'destination-in'
+    sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
+    // ...with bristle streaks dragged along it (grey hairs as soft light)...
+    if (stroke.streak > 0) {
+      sc.globalCompositeOperation = 'soft-light'
+      sc.globalAlpha = stroke.streak
+      sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
+    }
+    // ...and a little of the brush's own load, mixed with any wet paint it picked up
+    if (stroke.tint > 0) {
+      sc.globalCompositeOperation = 'source-atop'
+      sc.globalAlpha = stroke.tint
+      const p = stroke.pickup
+      const f = p ? stroke.mix : 0
+      sc.fillStyle = p
+        ? `rgb(${lerp(stroke.rgb[0], p[0], f) | 0}, ${lerp(stroke.rgb[1], p[1], f) | 0}, ${lerp(stroke.rgb[2], p[2], f) | 0})`
+        : stroke.color
+      sc.fillRect(x, y, w, h)
+    }
+  } else {
+    sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
+  }
+  if (stroke.dry > 0 && engine.weave) {
+    sc.globalCompositeOperation = 'destination-out'
+    sc.globalAlpha = stroke.dry
+    sc.fillStyle = engine.weave
+    sc.fillRect(x, y, w, h)
+  }
+  sc.restore()
 }
 
 /**
@@ -481,64 +524,53 @@ function beginStrokePaint(engine: StrokeEngine, stroke: Stroke): void {
  * for dry-brush texture, then cast a thin shadow and highlight so the paint reads
  * as a raised ridge (impasto), then the paint itself.
  */
-function renderStroke(target: CanvasRenderingContext2D, engine: StrokeEngine, stroke: Stroke): void {
+function renderStroke(
+  target: CanvasRenderingContext2D,
+  engine: StrokeEngine,
+  stroke: Stroke,
+  withRidge = true,
+): void {
   const { x, y, w, h } = stroke.bbox
-  let src: HTMLCanvasElement = engine.strokeLayer
-  const ref = stroke.level >= 0 ? engine.refs[stroke.level] : undefined
-
-  if (ref || (stroke.dry > 0 && engine.weave)) {
-    const sc = engine.scratchCtx
-    sc.save()
-    sc.clearRect(x, y, w, h)
-    if (ref) {
-      // The stroke carries the image as seen at this layer's scale...
-      sc.drawImage(ref, x, y, w, h, x, y, w, h)
-      sc.globalCompositeOperation = 'destination-in'
-      sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
-      // ...with a little of the brush's own paint (and bristle shading) over it
-      sc.globalCompositeOperation = 'source-atop'
-      sc.globalAlpha = stroke.tint
-      sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
-    } else {
-      sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
-    }
-    if (stroke.dry > 0 && engine.weave) {
-      sc.globalCompositeOperation = 'destination-out'
-      sc.globalAlpha = stroke.dry
-      sc.fillStyle = engine.weave
-      sc.fillRect(x, y, w, h)
-    }
-    sc.restore()
-    src = engine.scratch
-  }
+  // The scratch layer already holds this stroke fully composed (see composeArea)
+  const src = engine.scratch
 
   target.save()
-  if (engine.filters && stroke.style !== 'pencil') {
-    // Thin washes and tiny touches barely stand proud of the canvas; loaded strokes do
-    const body = (stroke.style === 'wash' ? 0.35 : 1) * clamp(stroke.baseWidth / 16, 0.35, 1) * stroke.relief
-    // Whole-pixel offsets: fractional ones resample past the stroke's bounds and
-    // drag in neighbouring pixels as faint straight lines
+  // Thin washes and tiny touches barely stand proud of the canvas; loaded strokes do
+  const body = (stroke.style === 'wash' ? 0.35 : 1) * clamp(stroke.baseWidth / 16, 0.35, 1) * stroke.relief
+  if (withRidge && body > 0.01 && stroke.style !== 'pencil') {
+    // Paint ridge: a dark silhouette offset down-right and a light one up-left,
+    // made by compositing (much cheaper than ctx.filter). Whole-pixel offsets:
+    // fractional ones resample past the bounds and show as faint straight lines.
     const off = stroke.baseWidth > 30 ? 2 : 1
-    target.filter = 'brightness(0)'
+    const sh = engine.shadeCtx
+    sh.save()
+    sh.clearRect(x, y, w, h)
+    sh.drawImage(src, x, y, w, h, x, y, w, h)
+    sh.globalCompositeOperation = 'source-in'
+    sh.fillStyle = '#000'
+    sh.fillRect(x, y, w, h)
     target.globalAlpha = 0.11 * body * stroke.alpha
-    target.drawImage(src, x, y, w, h, x + off, y + off, w, h)
-    target.filter = 'brightness(0) invert(1)'
+    target.drawImage(engine.shade, x, y, w, h, x + off, y + off, w, h)
+    sh.fillStyle = '#fff'
+    sh.fillRect(x, y, w, h)
     target.globalAlpha = 0.08 * body * stroke.alpha
-    target.drawImage(src, x, y, w, h, x - 1, y - 1, w, h)
-    target.filter = 'none'
+    target.drawImage(engine.shade, x, y, w, h, x - 1, y - 1, w, h)
+    sh.restore()
+    sh.clearRect(x, y, w, h)
   }
   target.globalAlpha = stroke.alpha
   target.drawImage(src, x, y, w, h, x, y, w, h)
   target.restore()
-  // Leave the scratch layer empty so no stale paint lingers beside the next stroke
-  if (src === engine.scratch) engine.scratchCtx.clearRect(x, y, w, h)
 }
 
 function commitTo(engine: StrokeEngine, stroke: Stroke, idx: number): void {
-  for (let i = engine.pathCursor + 1; i <= idx; i++) {
+  const from = engine.pathCursor
+  if (idx <= from) return
+  for (let i = from + 1; i <= idx; i++) {
     paintSegment(engine.strokeCtx, stroke, i - 1, i)
   }
-  engine.pathCursor = Math.max(engine.pathCursor, idx)
+  engine.pathCursor = idx
+  composeArea(engine, stroke, from, idx)
 }
 
 /** Brush lifts: lay the finished stroke onto the canvas at its opacity. */
@@ -548,6 +580,7 @@ function endStrokePaint(engine: StrokeEngine): void {
   const { x, y, w, h } = stroke.bbox
   renderStroke(engine.paintCtx, engine, stroke)
   engine.strokeCtx.clearRect(x, y, w, h)
+  engine.scratchCtx.clearRect(x, y, w, h)
   engine.activeStroke = null
   engine.pathCursor = 0
 }
@@ -829,16 +862,10 @@ function advanceHand(engine: StrokeEngine, target: number, dtSec: number): void 
 function compositeToScreen(ctx: CanvasRenderingContext2D, engine: StrokeEngine): void {
   ctx.save()
   ctx.globalAlpha = 1
-  ctx.fillStyle = GESSO
-  ctx.fillRect(0, 0, engine.width, engine.height)
+  // The paint layer is opaque (it starts as gesso), so it replaces the whole frame
   ctx.drawImage(engine.paintLayer, 0, 0)
-  if (engine.activeStroke) renderStroke(ctx, engine, engine.activeStroke)
-  // Canvas grain shows through everything, paint included
-  if (engine.relief) {
-    ctx.globalAlpha = 1
-    ctx.fillStyle = engine.relief
-    ctx.fillRect(0, 0, engine.width, engine.height)
-  }
+  // The wet stroke skips its ridge (drawn once when laid down) to keep frames light
+  if (engine.activeStroke) renderStroke(ctx, engine, engine.activeStroke, false)
   ctx.restore()
 }
 

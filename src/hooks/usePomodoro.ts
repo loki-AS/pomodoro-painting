@@ -36,6 +36,8 @@ export type PomodoroState = {
   durationMs: number
   running: boolean
   completedFocuses: number
+  /** Length of the break in progress, or of the one that follows this focus session */
+  upcomingBreakMs: number
   progress: number
   start: () => void
   pause: () => void
@@ -159,6 +161,10 @@ export function usePomodoro(): PomodoroState {
     durationMs,
     running,
     completedFocuses,
+    upcomingBreakMs:
+      phase === 'shortBreak' || phase === 'longBreak'
+        ? durationMs
+        : durationFor(nextAfterFocus(completedFocuses + 1)),
     progress: Math.min(1, Math.max(0, progress)),
     start,
     pause,

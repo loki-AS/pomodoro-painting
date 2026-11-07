@@ -90,6 +90,7 @@ export default function App() {
         artwork={artwork}
         progress={pomo.isBreak ? pomo.progress : 0}
         durationMs={pomo.durationMs}
+        breakMs={pomo.upcomingBreakMs}
         active={pomo.isBreak}
         onReadyChange={setCanvasReady}
         onCompleteChange={setPaintingDone}

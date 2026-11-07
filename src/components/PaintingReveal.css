@@ -19,6 +19,15 @@
   height: 100%;
 }
 
+/* Linen weave shading (tile from the engine); sits over paint like real canvas texture */
+.painting-reveal__weave {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-repeat: repeat;
+  background-size: 96px 96px;
+}
+
 .painting-reveal__grain {
   position: absolute;
   inset: 0;

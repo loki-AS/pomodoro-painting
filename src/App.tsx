@@ -101,6 +101,12 @@ export default function App() {
         visible={showCredit && canvasReady}
       />
 
+      {pomo.phase !== 'idle' && (
+        <p className="wordmark" aria-label="Atelier">
+          Atelier
+        </p>
+      )}
+
       <main className="app__main">
         {pomo.phase === 'idle' && (
           <div className="idle">

@@ -3,6 +3,8 @@ import type { Artwork } from '../lib/metApi'
 import { loadImage } from '../lib/metApi'
 import {
   createStrokeEngine,
+  isPaintingComplete,
+  paintEndFor,
   prepareCanvas,
   tickPainting,
   type StrokeEngine,
@@ -15,8 +17,12 @@ const READY_HOLD_MS = 500
 type Props = {
   artwork: Artwork | null
   progress: number
+  /** Length of the break, so the stroke count suits a calm painting pace */
+  durationMs?: number
   active: boolean
   onReadyChange?: (ready: boolean) => void
+  /** Fires true once the last stroke is down (the finished piece is now on show) */
+  onCompleteChange?: (complete: boolean) => void
 }
 
 function remapProgress(progress: number, origin: number): number {
@@ -27,9 +33,13 @@ function remapProgress(progress: number, origin: number): number {
 export function PaintingReveal({
   artwork,
   progress,
+  durationMs,
   active,
   onReadyChange,
+  onCompleteChange,
 }: Props) {
+  const durationRef = useRef(durationMs)
+  durationRef.current = durationMs
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const engineRef = useRef<StrokeEngine | null>(null)
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null)
@@ -39,10 +49,16 @@ export function PaintingReveal({
   const holdUntilRef = useRef(0)
   const progressRef = useRef(progress)
   const onReadyRef = useRef(onReadyChange)
+  const onCompleteRef = useRef(onCompleteChange)
+  const completeRef = useRef(false)
   progressRef.current = progress
   onReadyRef.current = onReadyChange
+  onCompleteRef.current = onCompleteChange
 
   useEffect(() => {
+    // A new canvas (or no canvas) is never a finished painting
+    completeRef.current = false
+    onCompleteRef.current?.(false)
     if (!active) {
       engineRef.current = null
       ctxRef.current = null
@@ -78,9 +94,16 @@ export function PaintingReveal({
         const img = await loadImage(imageUrl)
         if (cancelled || !canvasRef.current) return
 
-        const area = width * height
-        const strokeCount = Math.min(1100, Math.max(600, Math.round(area / 3200)))
-        const engine = createStrokeEngine(img, width, height, strokeCount)
+        // The plan scales its stroke budget to the painting time (break minus the
+        // finished-piece preview) so the hand keeps a natural pace
+        const seconds = (durationRef.current ?? 15 * 60 * 1000) / 1000
+        const paintSeconds = seconds * paintEndFor(seconds)
+        const t0 = performance.now()
+        const engine = createStrokeEngine(img, width, height, paintSeconds)
+        if (import.meta.env.DEV) {
+          const counts = engine.phases.map((p) => `${p.kind}:${p.end - p.start}`).join(" ")
+          console.info(`[paint] planned ${engine.strokes.length} strokes in ${Math.round(performance.now() - t0)}ms (${counts})`)
+        }
         if (cancelled) return
 
         // Canvas is loaded — show blank gesso first; brush waits for hold
@@ -129,6 +152,9 @@ export function PaintingReveal({
             // Start the painting clock only after canvas has been shown blank
             originRef.current = progressRef.current
             paintAllowedRef.current = true
+            // Finish early enough that the completed piece is on show for a while
+            const seconds = (durationRef.current ?? 0) / 1000
+            engine.paintEnd = paintEndFor(seconds * (1 - originRef.current))
           } else {
             tickPainting(ctx, engine, 0, dt)
             raf = requestAnimationFrame(frame)
@@ -138,6 +164,11 @@ export function PaintingReveal({
 
         const mapped = remapProgress(progressRef.current, originRef.current)
         tickPainting(ctx, engine, mapped, dt)
+        const done = isPaintingComplete(engine)
+        if (done !== completeRef.current) {
+          completeRef.current = done
+          onCompleteRef.current?.(done)
+        }
       } else {
         last = now
       }

@@ -1,253 +1,192 @@
-export type Stroke = {
-  points: { x: number; y: number }[]
-  baseWidth: number
-  alpha: number
-  color: string
-  kind: PassKind
-  style: StrokeStyle
-}
+import {
+  GESSO_RGB,
+  clamp,
+  downSec,
+  lerp,
+  liftSec,
+  planPainting,
+  rand,
+  randInt,
+  smoothstep,
+  strokeSec,
+  targetIndex,
+  travelSec,
+  type LayerKind,
+  type Phase,
+  type RGB,
+  type Stroke,
+} from './paintPlan'
 
-type PassKind = 'under' | 'block' | 'model' | 'detail'
-type StrokeStyle = 'wash' | 'bristle' | 'dab' | 'edge'
+export type { Stroke } from './paintPlan'
 
 export type BrushPose = {
   x: number
   y: number
+  /** Screen direction the handle points, from the tip toward the hand */
   angle: number
   color: string
   tipWidth: number
+  /** 0 = tip on the canvas, 1 = well above it */
+  lift: number
   visible: boolean
+  /** The sketch is drawn with a pencil, everything after with brushes */
+  tool: 'pencil' | 'brush'
+}
+
+type HandPhase = 'idle' | 'travel' | 'down' | 'stroke' | 'lift' | 'reload'
+
+type Hand = {
+  phase: HandPhase
+  /** Seconds elapsed in the current phase (hand time) */
+  t: number
+  dur: number
+  fromX: number
+  fromY: number
+  toX: number
+  toY: number
+  liftFrom: number
+  /** Index of the stroke being painted / next to paint (= completed strokes) */
+  next: number
+  untilReload: number
+  /** Estimated strokes/sec the timer is asking for */
+  rate: number
+  lastTarget: number
+  /** Running average of a stroke cycle's natural duration (sec) */
+  avgCycle: number
+  cycleAcc: number
+  speed: number
+  targetAngle: number
+  started: boolean
+  clock: number
+  /** Layer of the previous stroke: switching layers means changing tools */
+  lastKind: LayerKind | null
 }
 
 export type StrokeEngine = {
   strokes: Stroke[]
-  /** Continuous paint head: integer part = completed strokes, fraction = path along current */
-  head: number
-  source: HTMLCanvasElement
+  phases: Phase[]
+  /** The image blurred to each paint layer's scale; strokes carry these */
+  refs: HTMLCanvasElement[]
   paintLayer: HTMLCanvasElement
   paintCtx: CanvasRenderingContext2D
+  /**
+   * The stroke in progress is drawn opaque here and laid onto paintLayer once,
+   * at the stroke's alpha, so overlapping dabs/segments never double up.
+   */
+  strokeLayer: HTMLCanvasElement
+  strokeCtx: CanvasRenderingContext2D
+  activeStroke: Stroke | null
+  /** Scratch layer for composing a stroke (reference, tint, dry-brush mask) */
+  scratch: HTMLCanvasElement
+  scratchCtx: CanvasRenderingContext2D
+  /** Alpha mask of canvas-weave peaks (dry paint skips these) */
+  weave: CanvasPattern | null
+  /** Faint shading of the weave valleys, laid over the whole picture */
+  relief: CanvasPattern | null
+  /** Small CPU copy of the paint layer for reading the wet paint under the brush */
+  mirrorCtx: CanvasRenderingContext2D
+  mirrorW: number
+  mirrorH: number
+  mirrorAge: number
+  /** ctx.filter is supported (impasto edges need it) */
+  filters: boolean
   width: number
   height: number
   brush: BrushPose
+  hand: Hand
   /** Last point index committed on the active stroke */
   pathCursor: number
+  /** Painting progress (0..1) by which every stroke is done; the rest is a preview */
+  paintEnd: number
 }
 
 export const GESSO = '#e8dfd0'
 
-function rand(min: number, max: number): number {
-  return min + Math.random() * (max - min)
+/** Resting handle direction for a right-handed painter: tip upper-left, handle lower-right. */
+const REST_ANGLE = 0.8
+
+function angleDiff(a: number, b: number): number {
+  let d = (b - a) % (Math.PI * 2)
+  if (d > Math.PI) d -= Math.PI * 2
+  if (d < -Math.PI) d += Math.PI * 2
+  return d
 }
 
-function clamp(n: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, n))
+/** Minimum-jerk profile: how human reaching movements accelerate and settle. */
+function minJerk(u: number): number {
+  const t = clamp(u, 0, 1)
+  return t * t * t * (10 - 15 * t + 6 * t * t)
 }
 
-function shuffleInPlace<T>(arr: T[]): void {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    const tmp = arr[i]!
-    arr[i] = arr[j]!
-    arr[j] = tmp
+/** Bell-shaped stroke speed that never fully stalls (paint keeps flowing). */
+function strokeEase(u: number): number {
+  return 0.3 * u + 0.7 * minJerk(u)
+}
+
+/**
+ * Procedural plain-weave linen tile. `mask` is opaque on thread crowns (where a dry
+ * brush leaves no paint); `shade` darkens the hollows between threads very slightly.
+ */
+function makeWeaveTiles(): { mask: HTMLCanvasElement; shade: HTMLCanvasElement } | null {
+  const size = 96
+  const period = 4
+  const mask = document.createElement('canvas')
+  const shade = document.createElement('canvas')
+  mask.width = mask.height = shade.width = shade.height = size
+  const mctx = mask.getContext('2d')
+  const sctx = shade.getContext('2d')
+  if (!mctx || !sctx) return null
+
+  // Wrapping value noise so thread thickness and tension vary like real linen
+  const g = 6
+  const cell = size / g
+  const grid = Array.from({ length: g * g }, () => Math.random())
+  const noise = (x: number, y: number) => {
+    const gx = x / cell
+    const gy = y / cell
+    const x0 = Math.floor(gx)
+    const y0 = Math.floor(gy)
+    const fx = gx - x0
+    const fy = gy - y0
+    const at = (i: number, j: number) => grid[((j % g) + g) % g * g + (((i % g) + g) % g)]!
+    const sx = fx * fx * (3 - 2 * fx)
+    const sy = fy * fy * (3 - 2 * fy)
+    return lerp(lerp(at(x0, y0), at(x0 + 1, y0), sx), lerp(at(x0, y0 + 1), at(x0 + 1, y0 + 1), sx), sy)
   }
-}
 
-type SampleBuf = {
-  pixels: Uint8ClampedArray
-  w: number
-  h: number
-}
-
-function sampleColor(
-  sample: SampleBuf,
-  x: number,
-  y: number,
-  fullW: number,
-  fullH: number,
-  jitter = 10,
-): string {
-  const sx = clamp(Math.floor((x / fullW) * sample.w), 0, sample.w - 1)
-  const sy = clamp(Math.floor((y / fullH) * sample.h), 0, sample.h - 1)
-  const i = (sy * sample.w + sx) * 4
-  let r = sample.pixels[i]!
-  let g = sample.pixels[i + 1]!
-  let b = sample.pixels[i + 2]!
-  r = clamp(r + rand(-jitter, jitter), 0, 255)
-  g = clamp(g + rand(-jitter, jitter), 0, 255)
-  b = clamp(b + rand(-jitter, jitter), 0, 255)
-  return `rgb(${r | 0}, ${g | 0}, ${b | 0})`
-}
-
-function regionAverageColor(
-  sample: SampleBuf,
-  cx: number,
-  cy: number,
-  radius: number,
-  fullW: number,
-  fullH: number,
-  posterize = 20,
-): string {
-  const scaleX = sample.w / fullW
-  const scaleY = sample.h / fullH
-  const sx = cx * scaleX
-  const sy = cy * scaleY
-  const rx = radius * scaleX
-  const ry = radius * scaleY
-  let r = 0
-  let g = 0
-  let b = 0
-  let n = 0
-  const x0 = clamp(Math.floor(sx - rx), 0, sample.w - 1)
-  const x1 = clamp(Math.floor(sx + rx), 0, sample.w - 1)
-  const y0 = clamp(Math.floor(sy - ry), 0, sample.h - 1)
-  const y1 = clamp(Math.floor(sy + ry), 0, sample.h - 1)
-  const step = Math.max(1, Math.floor(Math.max(rx, ry) / 5))
-
-  for (let y = y0; y <= y1; y += step) {
-    for (let x = x0; x <= x1; x += step) {
-      const i = (y * sample.w + x) * 4
-      r += sample.pixels[i]!
-      g += sample.pixels[i + 1]!
-      b += sample.pixels[i + 2]!
-      n++
+  const mImg = mctx.createImageData(size, size)
+  const sImg = sctx.createImageData(size, size)
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const warp = 0.5 - 0.5 * Math.cos((2 * Math.PI * x) / period)
+      const weft = 0.5 - 0.5 * Math.cos((2 * Math.PI * y) / period)
+      // Plain weave: warp and weft take turns lying on top
+      const over = (Math.floor(x / period) + Math.floor(y / period)) % 2 === 0
+      const crown = over ? warp * 0.75 + weft * 0.25 : weft * 0.75 + warp * 0.25
+      const n = noise(x, y)
+      // Paint skips in irregular patches (where the brush rode high), not uniformly
+      const v = crown * 0.55 + n * 0.45 + (Math.random() - 0.5) * 0.14
+      const i = (y * size + x) * 4
+      mImg.data[i + 3] = smoothstep(0.66, 0.97, v) * 255
+      // Thread hollows, unevenly deep, so the grain reads as linen rather than a grid
+      sImg.data[i + 3] = (1 - crown) * (0.025 + 0.035 * n + Math.random() * 0.012) * 255
     }
   }
-
-  if (!n) return sampleColor(sample, cx, cy, fullW, fullH, 8)
-  const qr = ((r / n / posterize) | 0) * posterize
-  const qg = ((g / n / posterize) | 0) * posterize
-  const qb = ((b / n / posterize) | 0) * posterize
-  return `rgb(${qr}, ${qg}, ${qb})`
+  mctx.putImageData(mImg, 0, 0)
+  sctx.putImageData(sImg, 0, 0)
+  return { mask, shade }
 }
 
-function pickStyle(kind: PassKind): StrokeStyle {
-  const roll = Math.random()
-  if (kind === 'under') return roll < 0.55 ? 'wash' : 'bristle'
-  if (kind === 'block') return roll < 0.6 ? 'bristle' : roll < 0.85 ? 'dab' : 'wash'
-  if (kind === 'model') return roll < 0.7 ? 'bristle' : roll < 0.9 ? 'dab' : 'edge'
-  return roll < 0.55 ? 'edge' : 'bristle'
-}
 
-function generateStroke(
-  width: number,
-  height: number,
-  cx: number,
-  cy: number,
-  angle: number,
-  kind: PassKind,
-  sample: SampleBuf,
-): Stroke {
-  const specs = {
-    under: { len: [90, 220], curve: 0.15, width: [70, 180], alpha: [0.72, 0.95], avgR: 100 },
-    block: { len: [45, 140], curve: 0.28, width: [18, 50], alpha: [0.82, 0.98], avgR: 32 },
-    model: { len: [28, 95], curve: 0.32, width: [7, 20], alpha: [0.85, 1], avgR: 14 },
-    detail: { len: [10, 42], curve: 0.22, width: [2, 8], alpha: [0.88, 1], avgR: 4 },
-  }[kind]
-
-  const style = pickStyle(kind)
-  const length =
-    style === 'wash' ? rand(specs.len[0] * 0.4, specs.len[1] * 0.6) : rand(specs.len[0], specs.len[1])
-  const curve = rand(-specs.curve, specs.curve)
-  const steps = Math.max(5, Math.floor(length / (style === 'wash' ? 14 : 7)))
-  const points: { x: number; y: number }[] = []
-
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps
-    const dist = t * length
-    const bend = Math.sin(t * Math.PI) * curve * length
-    const x = cx + Math.cos(angle) * dist + Math.cos(angle + Math.PI / 2) * bend
-    const y = cy + Math.sin(angle) * dist + Math.sin(angle + Math.PI / 2) * bend
-    points.push({ x: clamp(x, 0, width), y: clamp(y, 0, height) })
-  }
-
-  const mid = points[Math.floor(points.length / 2)] ?? { x: cx, y: cy }
-  const color =
-    kind === 'under' || kind === 'block'
-      ? regionAverageColor(sample, mid.x, mid.y, specs.avgR, width, height, kind === 'under' ? 28 : 16)
-      : sampleColor(sample, mid.x, mid.y, width, height, kind === 'detail' ? 4 : 12)
-
-  return {
-    points,
-    baseWidth: rand(specs.width[0], specs.width[1]),
-    alpha: rand(specs.alpha[0], specs.alpha[1]),
-    color,
-    kind,
-    style,
-  }
-}
-
-function orderedCellIndices(cols: number, rows: number): number[] {
-  const cells: { i: number; dist: number }[] = []
-  const cx = (cols - 1) / 2
-  const cy = (rows - 1) / 2
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const dist = Math.hypot(c - cx, r - cy) + rand(-0.35, 0.35)
-      cells.push({ i: r * cols + c, dist })
-    }
-  }
-  cells.sort((a, b) => a.dist - b.dist)
-  return cells.map((c) => c.i)
-}
-
-function addPass(
-  strokes: Stroke[],
-  kind: PassKind,
-  count: number,
-  width: number,
-  height: number,
-  sample: SampleBuf,
-): void {
-  const aspect = width / height
-  const cols = Math.max(2, Math.ceil(Math.sqrt(count * aspect)))
-  const rows = Math.max(2, Math.ceil(count / cols))
-  const cellW = width / cols
-  const cellH = height / rows
-  const regionAngles = new Map<string, number>()
-  const perCell: Stroke[][] = Array.from({ length: cols * rows }, () => [])
-
-  let made = 0
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      if (made >= count) break
-      const regionKey = `${Math.floor(r / 2)}_${Math.floor(c / 2)}`
-      if (!regionAngles.has(regionKey)) {
-        regionAngles.set(regionKey, rand(0, Math.PI))
-      }
-      const baseAngle = regionAngles.get(regionKey)!
-      const angle = baseAngle + rand(-0.45, 0.45)
-      const cx = (c + 0.5) * cellW + rand(-cellW * 0.35, cellW * 0.35)
-      const cy = (r + 0.5) * cellH + rand(-cellH * 0.35, cellH * 0.35)
-      const cellIndex = r * cols + c
-      const extras = kind === 'under' ? 1 : kind === 'block' ? 1 + (Math.random() < 0.4 ? 1 : 0) : 1
-      for (let e = 0; e < extras && made < count; e++) {
-        perCell[cellIndex]!.push(
-          generateStroke(
-            width,
-            height,
-            cx + rand(-cellW * 0.15, cellW * 0.15),
-            cy + rand(-cellH * 0.15, cellH * 0.15),
-            angle + rand(-0.2, 0.2),
-            kind,
-            sample,
-          ),
-        )
-        made++
-      }
-    }
-  }
-
-  for (const cell of perCell) shuffleInPlace(cell)
-  for (const idx of orderedCellIndices(cols, rows)) {
-    strokes.push(...(perCell[idx] ?? []))
-  }
-}
-
+/**
+ * Build the engine: fit the image to the screen, plan the whole painting (sketch
+ * through detail), and prepare the layers the hand paints into.
+ */
 export function createStrokeEngine(
   image: HTMLImageElement,
   canvasWidth: number,
   canvasHeight: number,
-  strokeCount = 1200,
+  breakSeconds = 15 * 60,
 ): StrokeEngine {
   const source = document.createElement('canvas')
   source.width = canvasWidth
@@ -255,76 +194,111 @@ export function createStrokeEngine(
   const sctx = source.getContext('2d')
   if (!sctx) throw new Error('Could not create source canvas')
 
-  const scale = Math.max(
-    canvasWidth / image.naturalWidth,
-    canvasHeight / image.naturalHeight,
-  )
+  const scale = Math.max(canvasWidth / image.naturalWidth, canvasHeight / image.naturalHeight)
   const dw = image.naturalWidth * scale
   const dh = image.naturalHeight * scale
-  const dx = (canvasWidth - dw) / 2
-  const dy = (canvasHeight - dh) / 2
   sctx.fillStyle = GESSO
   sctx.fillRect(0, 0, canvasWidth, canvasHeight)
-  sctx.drawImage(image, dx, dy, dw, dh)
+  sctx.drawImage(image, (canvasWidth - dw) / 2, (canvasHeight - dh) / 2, dw, dh)
 
-  const sampleMax = 480
-  const sampleScale = Math.min(1, sampleMax / Math.max(canvasWidth, canvasHeight))
-  const sampleW = Math.max(1, Math.round(canvasWidth * sampleScale))
-  const sampleH = Math.max(1, Math.round(canvasHeight * sampleScale))
-  const sampleCanvas = document.createElement('canvas')
-  sampleCanvas.width = sampleW
-  sampleCanvas.height = sampleH
-  const sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true })
-  if (!sampleCtx) throw new Error('Could not create sample canvas')
-  sampleCtx.drawImage(source, 0, 0, sampleW, sampleH)
-  const sample: SampleBuf = {
-    pixels: sampleCtx.getImageData(0, 0, sampleW, sampleH).data,
-    w: sampleW,
-    h: sampleH,
+  const plan = planPainting(source, canvasWidth, canvasHeight, breakSeconds)
+
+  const layer = (opts?: CanvasRenderingContext2DSettings) => {
+    const c = document.createElement('canvas')
+    c.width = canvasWidth
+    c.height = canvasHeight
+    const ctx = c.getContext('2d', opts)
+    if (!ctx) throw new Error('Could not create canvas layer')
+    return [c, ctx] as const
   }
 
-  const paintLayer = document.createElement('canvas')
-  paintLayer.width = canvasWidth
-  paintLayer.height = canvasHeight
-  const paintCtx = paintLayer.getContext('2d')
-  if (!paintCtx) throw new Error('Could not create paint layer')
+  const [paintLayer, paintCtx] = layer()
   paintCtx.fillStyle = GESSO
   paintCtx.fillRect(0, 0, canvasWidth, canvasHeight)
+  const [strokeLayer, strokeCtx] = layer()
+  const [scratch, scratchCtx] = layer()
 
-  const strokes: Stroke[] = []
-  const under = Math.round(strokeCount * 0.18)
-  const block = Math.round(strokeCount * 0.32)
-  const model = Math.round(strokeCount * 0.34)
-  const detail = Math.max(1, strokeCount - under - block - model)
+  const mirrorW = 192
+  const mirrorH = Math.max(1, Math.round((canvasHeight / canvasWidth) * mirrorW))
+  const mirror = document.createElement('canvas')
+  mirror.width = mirrorW
+  mirror.height = mirrorH
+  const mirrorCtx = mirror.getContext('2d', { willReadFrequently: true })
+  if (!mirrorCtx) throw new Error('Could not create paint mirror')
 
-  addPass(strokes, 'under', under, canvasWidth, canvasHeight, sample)
-  addPass(strokes, 'block', block, canvasWidth, canvasHeight, sample)
-  addPass(strokes, 'model', model, canvasWidth, canvasHeight, sample)
-  addPass(strokes, 'detail', detail, canvasWidth, canvasHeight, sample)
+  const weaveTiles = makeWeaveTiles()
+  const weave = weaveTiles ? strokeCtx.createPattern(weaveTiles.mask, 'repeat') : null
+  const relief = weaveTiles ? strokeCtx.createPattern(weaveTiles.shade, 'repeat') : null
+  strokeCtx.filter = 'brightness(0)'
+  const filters = strokeCtx.filter === 'brightness(0)'
+  strokeCtx.filter = 'none'
 
   return {
-    strokes,
-    head: 0,
-    source,
+    strokes: plan.strokes,
+    phases: plan.phases,
+    refs: plan.refs,
     paintLayer,
     paintCtx,
+    strokeLayer,
+    strokeCtx,
+    activeStroke: null,
+    scratch,
+    scratchCtx,
+    weave,
+    relief,
+    mirrorCtx,
+    mirrorW,
+    mirrorH,
+    mirrorAge: 0,
+    filters,
     width: canvasWidth,
     height: canvasHeight,
     pathCursor: 0,
+    paintEnd: 0.94,
     brush: {
-      x: canvasWidth * 0.5,
-      y: canvasHeight * 0.5,
-      angle: -Math.PI / 4,
-      color: '#5a4638',
+      // The hand enters from off-canvas, lower right, where it rests
+      x: canvasWidth * 0.95,
+      y: canvasHeight * 1.1,
+      angle: REST_ANGLE,
+      color: '#3e3832',
       tipWidth: 18,
+      lift: 1,
       visible: false,
+      tool: 'pencil',
+    },
+    hand: {
+      phase: 'idle',
+      t: 0,
+      dur: 0,
+      fromX: 0,
+      fromY: 0,
+      toX: 0,
+      toY: 0,
+      liftFrom: 1,
+      next: 0,
+      untilReload: randInt(5, 9),
+      rate: 0,
+      lastTarget: 0,
+      avgCycle: 0.4,
+      cycleAcc: 0,
+      speed: 1,
+      targetAngle: REST_ANGLE,
+      started: false,
+      clock: 0,
+      lastKind: null,
     },
   }
 }
 
-function pressureWidth(baseWidth: number, t: number): number {
-  const envelope = Math.sin(t * Math.PI)
-  return Math.max(1.2, baseWidth * (0.35 + 0.65 * envelope))
+/**
+ * Flat-brush pressure: bristles splay to full width right after touchdown, hold,
+ * then narrow a little as the brush lifts (not a lemon-shaped sine swell).
+ */
+function strokeWidthAt(stroke: Stroke, i: number): number {
+  const t = stroke.cum[i]! / stroke.length
+  const press = stroke.style === 'dab' ? 1 : 0.62 + 0.38 * smoothstep(0, 0.14, t)
+  const lift = 1 - 0.32 * smoothstep(0.74, 1, t)
+  return Math.max(1.2, stroke.baseWidth * press * lift)
 }
 
 function strokeAngleAt(stroke: Stroke, index: number): number {
@@ -336,23 +310,82 @@ function strokeAngleAt(stroke: Stroke, index: number): number {
   return Math.atan2(b.y - a.y, b.x - a.x)
 }
 
-function setBrush(
-  engine: StrokeEngine,
-  stroke: Stroke,
-  pointIndex: number,
-  visible: boolean,
-): void {
-  const pts = stroke.points
-  const p = pts[clamp(pointIndex, 0, pts.length - 1)]!
-  engine.brush.x = p.x
-  engine.brush.y = p.y
-  engine.brush.angle = strokeAngleAt(stroke, pointIndex)
-  engine.brush.color = stroke.color
-  engine.brush.tipWidth = Math.max(6, Math.min(42, stroke.baseWidth * 0.55))
-  engine.brush.visible = visible
+/**
+ * The handle doesn't flip around with stroke direction: the wrist stays roughly put
+ * and the handle only leans toward whichever way the bristles are dragged.
+ */
+function handleAngleFor(strokeDir: number, clock: number): number {
+  const rest = REST_ANGLE + Math.sin(clock * 0.31) * 0.12
+  const trailing = strokeDir + Math.PI
+  const pick =
+    Math.abs(angleDiff(rest, trailing)) < Math.abs(angleDiff(rest, strokeDir)) ? trailing : strokeDir
+  return rest + angleDiff(rest, pick) * 0.38
 }
 
-/** Paint one path segment (bristle / edge / dab) between two points. */
+/** Point at arc length `s` along the stroke, plus the index of the segment it falls in. */
+function pointAt(stroke: Stroke, s: number): { x: number; y: number; i: number } {
+  const { points, cum } = stroke
+  if (s <= 0) return { ...points[0]!, i: 0 }
+  if (s >= stroke.length) return { ...points[points.length - 1]!, i: points.length - 1 }
+  let i = 1
+  while (i < cum.length - 1 && cum[i]! < s) i++
+  const a = points[i - 1]!
+  const b = points[i]!
+  const seg = cum[i]! - cum[i - 1]!
+  const f = seg > 0 ? (s - cum[i - 1]!) / seg : 0
+  return { x: lerp(a.x, b.x, f), y: lerp(a.y, b.y, f), i: i - 1 }
+}
+
+/**
+ * Fill one ribbon quad between points i0 and i1, offset sideways by `off` (fraction
+ * of brush width) with thickness `thick` (fraction of brush width). Using per-point
+ * normals and widths keeps neighbouring quads seamless, so edges stay smooth instead
+ * of scalloped. The quad reaches back a hair so anti-aliased seams never show.
+ */
+function ribbonQuad(
+  ctx: CanvasRenderingContext2D,
+  stroke: Stroke,
+  i0: number,
+  i1: number,
+  off: number,
+  thick: number,
+): void {
+  const p0 = stroke.points[i0]!
+  const p1 = stroke.points[i1]!
+  const n0 = stroke.normals[i0]!
+  const n1 = stroke.normals[i1]!
+  const w0 = strokeWidthAt(stroke, i0)
+  const w1 = strokeWidthAt(stroke, i1)
+  const dx = p1.x - p0.x
+  const dy = p1.y - p0.y
+  const len = Math.hypot(dx, dy) || 1
+  const bx = (-dx / len) * 0.75
+  const by = (-dy / len) * 0.75
+  const c0 = off * w0
+  const c1 = off * w1
+  const h0 = (thick * w0) / 2
+  const h1 = (thick * w1) / 2
+  ctx.beginPath()
+  ctx.moveTo(p0.x + bx + n0.x * (c0 - h0), p0.y + by + n0.y * (c0 - h0))
+  ctx.lineTo(p0.x + bx + n0.x * (c0 + h0), p0.y + by + n0.y * (c0 + h0))
+  ctx.lineTo(p1.x + n1.x * (c1 + h1), p1.y + n1.y * (c1 + h1))
+  ctx.lineTo(p1.x + n1.x * (c1 - h1), p1.y + n1.y * (c1 - h1))
+  ctx.closePath()
+  ctx.fill()
+}
+
+/** Rounded end where the brush meets or leaves the canvas. */
+function endCap(ctx: CanvasRenderingContext2D, stroke: Stroke, i: number, thick: number): void {
+  const p = stroke.points[i]!
+  const n = stroke.normals[i]!
+  const w = strokeWidthAt(stroke, i) * thick
+  ctx.beginPath()
+  // Flat brush: wide across the stroke, short along it
+  ctx.ellipse(p.x, p.y, w * 0.5, w * 0.22, Math.atan2(n.y, n.x), 0, Math.PI * 2)
+  ctx.fill()
+}
+
+/** Paint one path segment between two points, opaque, onto the stroke layer. */
 function paintSegment(
   ctx: CanvasRenderingContext2D,
   stroke: Stroke,
@@ -361,86 +394,547 @@ function paintSegment(
 ): void {
   const pts = stroke.points
   if (i0 < 0 || i1 >= pts.length || i1 <= i0) return
-  const p0 = pts[i0]!
-  const p1 = pts[i1]!
-  const t = i1 / Math.max(1, pts.length - 1)
-  const w = pressureWidth(stroke.baseWidth, t)
+  const last = i1 === pts.length - 1
+  const t1 = stroke.cum[i1]! / stroke.length
+
+  const tMid = (stroke.cum[i0]! + stroke.cum[i1]!) / 2 / stroke.length
 
   ctx.save()
-  ctx.lineCap = 'round'
-  ctx.lineJoin = 'round'
-  ctx.strokeStyle = stroke.color
-  ctx.fillStyle = stroke.color
+  ctx.fillStyle = wetColor(stroke, stroke.rgb, tMid)
 
-  if (stroke.style === 'dab' || stroke.style === 'wash') {
-    ctx.globalAlpha = stroke.alpha * rand(0.8, 1)
-    const ang = Math.atan2(p1.y - p0.y, p1.x - p0.x)
-    ctx.translate(p1.x, p1.y)
-    ctx.rotate(ang)
-    ctx.beginPath()
-    ctx.ellipse(0, 0, w * 0.45, w * 0.22, 0, 0, Math.PI * 2)
-    ctx.fill()
-  } else if (stroke.style === 'edge') {
-    ctx.globalAlpha = stroke.alpha
-    ctx.lineWidth = w * 0.85
-    ctx.beginPath()
-    ctx.moveTo(p0.x, p0.y)
-    ctx.lineTo(p1.x, p1.y)
-    ctx.stroke()
-  } else {
-    // bristle: a few parallel hairs for this segment
-    const hairs = Math.max(3, Math.min(6, Math.round(stroke.baseWidth / 8)))
-    const ang = Math.atan2(p1.y - p0.y, p1.x - p0.x) + Math.PI / 2
+  if (stroke.style === 'bristle') {
+    // Parallel hair tracks, each its own shade; some run dry before the end
+    const hairs = stroke.hairRgb.length
+    const tNext = last ? Infinity : stroke.cum[i1 + 1]! / stroke.length
     for (let h = 0; h < hairs; h++) {
-      const offset = (h - (hairs - 1) / 2) * (w / hairs)
-      const ox = Math.cos(ang) * offset
-      const oy = Math.sin(ang) * offset
-      ctx.globalAlpha = stroke.alpha * rand(0.7, 1)
-      ctx.lineWidth = Math.max(1.2, w / hairs)
-      ctx.beginPath()
-      ctx.moveTo(p0.x + ox, p0.y + oy)
-      ctx.lineTo(p1.x + ox, p1.y + oy)
-      ctx.stroke()
+      if (t1 > stroke.hairEnd[h]!) continue
+      ctx.fillStyle = wetColor(stroke, stroke.hairRgb[h]!, tMid)
+      const off = (h - (hairs - 1) / 2) / hairs
+      ribbonQuad(ctx, stroke, i0, i1, off, stroke.hairFill / hairs)
+      // This hair's last segment: round its tip so the stroke frays, not steps
+      if (tNext > stroke.hairEnd[h]!) {
+        const p = pts[i1]!
+        const n = stroke.normals[i1]!
+        const w = strokeWidthAt(stroke, i1)
+        const hw = (w * stroke.hairFill) / hairs
+        ctx.beginPath()
+        ctx.ellipse(p.x + n.x * off * w, p.y + n.y * off * w, hw * 0.5, hw * 0.9, Math.atan2(n.y, n.x), 0, Math.PI * 2)
+        ctx.fill()
+      }
     }
+  } else {
+    const thick = stroke.style === 'edge' ? 0.85 : 1
+    ribbonQuad(ctx, stroke, i0, i1, 0, thick)
+    if (last) endCap(ctx, stroke, i1, thick)
   }
   ctx.restore()
 }
 
-function paintStrokeIndex(progress: number, total: number): number {
-  const t = Math.max(0, Math.min(1, progress))
-  let phase: number
-  if (t < 0.25) phase = (t / 0.25) * 0.18
-  else if (t < 0.55) phase = 0.18 + ((t - 0.25) / 0.3) * 0.32
-  else if (t < 0.85) phase = 0.5 + ((t - 0.55) / 0.3) * 0.34
-  else phase = 0.84 + ((t - 0.85) / 0.15) * 0.16
-  return Math.min(total, phase * total)
+/**
+ * Wet-on-wet: at touchdown the brush carries some of the paint it landed in.
+ * That mix is strongest at the start and clears as fresh paint flows from the brush.
+ */
+function wetColor(stroke: Stroke, base: RGB, t: number): string {
+  const p = stroke.pickup
+  if (!p || stroke.mix <= 0) return `rgb(${base[0]}, ${base[1]}, ${base[2]})`
+  const f = stroke.mix * (1 - smoothstep(0, 0.6, t))
+  return `rgb(${lerp(base[0], p[0], f) | 0}, ${lerp(base[1], p[1], f) | 0}, ${lerp(base[2], p[2], f) | 0})`
 }
 
-function compositeToScreen(
-  ctx: CanvasRenderingContext2D,
-  engine: StrokeEngine,
-  settleAlpha: number,
-): void {
+
+/** Colour of the wet paint already on the canvas under (x, y), or null on bare gesso. */
+function pickupAt(engine: StrokeEngine, x: number, y: number): RGB | null {
+  // Refresh the small CPU copy every few strokes; one readback is cheap, hundreds aren't
+  if (engine.mirrorAge++ % 6 === 0) {
+    engine.mirrorCtx.drawImage(engine.paintLayer, 0, 0, engine.mirrorW, engine.mirrorH)
+  }
+  const mx = clamp(Math.floor((x / engine.width) * engine.mirrorW), 0, engine.mirrorW - 1)
+  const my = clamp(Math.floor((y / engine.height) * engine.mirrorH), 0, engine.mirrorH - 1)
+  const d = engine.mirrorCtx.getImageData(mx, my, 1, 1).data
+  const rgb: RGB = [d[0]!, d[1]!, d[2]!]
+  const bare =
+    Math.abs(rgb[0] - GESSO_RGB[0]) + Math.abs(rgb[1] - GESSO_RGB[1]) + Math.abs(rgb[2] - GESSO_RGB[2]) < 12
+  return bare ? null : rgb
+}
+
+/** Loaded tip touching the canvas at the start of a stroke. */
+function dropBlotch(ctx: CanvasRenderingContext2D, stroke: Stroke): void {
+  ctx.save()
+  ctx.fillStyle = wetColor(stroke, stroke.rgb, 0)
+  endCap(ctx, stroke, 0, stroke.style === 'edge' ? 0.85 : 1)
+  ctx.restore()
+}
+
+/** Brush touches down: start a fresh stroke layer with the loaded-tip blotch. */
+function beginStrokePaint(engine: StrokeEngine, stroke: Stroke): void {
+  const { x, y, w, h } = stroke.bbox
+  engine.strokeCtx.clearRect(x, y, w, h)
+  engine.activeStroke = stroke
+  engine.pathCursor = 0
+  const p0 = stroke.points[0]!
+  stroke.pickup = pickupAt(engine, p0.x, p0.y)
+  dropBlotch(engine.strokeCtx, stroke)
+}
+
+/**
+ * Lay a stroke from the stroke layer onto `target`: knock out canvas-weave peaks
+ * for dry-brush texture, then cast a thin shadow and highlight so the paint reads
+ * as a raised ridge (impasto), then the paint itself.
+ */
+function renderStroke(target: CanvasRenderingContext2D, engine: StrokeEngine, stroke: Stroke): void {
+  const { x, y, w, h } = stroke.bbox
+  let src: HTMLCanvasElement = engine.strokeLayer
+  const ref = stroke.level >= 0 ? engine.refs[stroke.level] : undefined
+
+  if (ref || (stroke.dry > 0 && engine.weave)) {
+    const sc = engine.scratchCtx
+    sc.save()
+    sc.clearRect(x, y, w, h)
+    if (ref) {
+      // The stroke carries the image as seen at this layer's scale...
+      sc.drawImage(ref, x, y, w, h, x, y, w, h)
+      sc.globalCompositeOperation = 'destination-in'
+      sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
+      // ...with a little of the brush's own paint (and bristle shading) over it
+      sc.globalCompositeOperation = 'source-atop'
+      sc.globalAlpha = stroke.tint
+      sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
+    } else {
+      sc.drawImage(engine.strokeLayer, x, y, w, h, x, y, w, h)
+    }
+    if (stroke.dry > 0 && engine.weave) {
+      sc.globalCompositeOperation = 'destination-out'
+      sc.globalAlpha = stroke.dry
+      sc.fillStyle = engine.weave
+      sc.fillRect(x, y, w, h)
+    }
+    sc.restore()
+    src = engine.scratch
+  }
+
+  target.save()
+  if (engine.filters && stroke.style !== 'pencil') {
+    // Thin washes and tiny touches barely stand proud of the canvas; loaded strokes do
+    const body = (stroke.style === 'wash' ? 0.35 : 1) * clamp(stroke.baseWidth / 16, 0.35, 1) * stroke.relief
+    // Whole-pixel offsets: fractional ones resample past the stroke's bounds and
+    // drag in neighbouring pixels as faint straight lines
+    const off = stroke.baseWidth > 30 ? 2 : 1
+    target.filter = 'brightness(0)'
+    target.globalAlpha = 0.11 * body * stroke.alpha
+    target.drawImage(src, x, y, w, h, x + off, y + off, w, h)
+    target.filter = 'brightness(0) invert(1)'
+    target.globalAlpha = 0.08 * body * stroke.alpha
+    target.drawImage(src, x, y, w, h, x - 1, y - 1, w, h)
+    target.filter = 'none'
+  }
+  target.globalAlpha = stroke.alpha
+  target.drawImage(src, x, y, w, h, x, y, w, h)
+  target.restore()
+  // Leave the scratch layer empty so no stale paint lingers beside the next stroke
+  if (src === engine.scratch) engine.scratchCtx.clearRect(x, y, w, h)
+}
+
+function commitTo(engine: StrokeEngine, stroke: Stroke, idx: number): void {
+  for (let i = engine.pathCursor + 1; i <= idx; i++) {
+    paintSegment(engine.strokeCtx, stroke, i - 1, i)
+  }
+  engine.pathCursor = Math.max(engine.pathCursor, idx)
+}
+
+/** Brush lifts: lay the finished stroke onto the canvas at its opacity. */
+function endStrokePaint(engine: StrokeEngine): void {
+  const stroke = engine.activeStroke
+  if (!stroke) return
+  const { x, y, w, h } = stroke.bbox
+  renderStroke(engine.paintCtx, engine, stroke)
+  engine.strokeCtx.clearRect(x, y, w, h)
+  engine.activeStroke = null
+  engine.pathCursor = 0
+}
+
+function paintWholeStroke(engine: StrokeEngine, stroke: Stroke): void {
+  beginStrokePaint(engine, stroke)
+  commitTo(engine, stroke, stroke.points.length - 1)
+  endStrokePaint(engine)
+}
+
+// ---------------------------------------------------------------------------
+// Hand: a small state machine that moves the brush like a person would —
+// travel above the canvas, press down, drag with a bell-shaped speed, lift,
+// and occasionally pause to reload paint.
+// ---------------------------------------------------------------------------
+
+
+
+function approachPoint(stroke: Stroke): { x: number; y: number } {
+  const p0 = stroke.points[0]!
+  const a = strokeAngleAt(stroke, 0)
+  const back = Math.min(14, stroke.baseWidth * 0.35 + 4)
+  return { x: p0.x - Math.cos(a) * back, y: p0.y - Math.sin(a) * back }
+}
+
+function setPhase(h: Hand, phase: HandPhase, dur: number): void {
+  h.phase = phase
+  h.t = 0
+  h.dur = dur
+}
+
+function beginNext(engine: StrokeEngine, target: number): void {
+  const h = engine.hand
+  const b = engine.brush
+  h.fromX = b.x
+  h.fromY = b.y
+  h.liftFrom = b.lift
+
+  if (h.next >= engine.strokes.length || h.next >= target) {
+    setPhase(h, 'idle', Infinity)
+    return
+  }
+
+  const stroke = engine.strokes[h.next]!
+
+  // Moving to the next stage: step back, put down the pencil / change brush
+  if (h.started && h.lastKind !== stroke.kind) {
+    h.lastKind = stroke.kind
+    h.untilReload = randInt(5, 9)
+    setPhase(h, 'reload', rand(0.9, 1.4))
+    return
+  }
+  h.lastKind = stroke.kind
+
+  // Pause to reload paint only when there's time to spare
+  if (stroke.style !== 'pencil' && h.untilReload <= 0 && h.speed < 1.3 && h.started) {
+    h.untilReload = randInt(5, 9)
+    setPhase(h, 'reload', rand(0.45, 0.9))
+    return
+  }
+
+  const ap = approachPoint(stroke)
+  h.toX = ap.x
+  h.toY = ap.y
+  const dist = Math.hypot(ap.x - b.x, ap.y - b.y)
+  const dur = travelSec(dist, stroke)
+  h.cycleAcc = dur + downSec(stroke) + strokeSec(stroke) + liftSec(stroke)
+  h.targetAngle = handleAngleFor(strokeAngleAt(stroke, 0), h.clock)
+  b.tool = stroke.style === 'pencil' ? 'pencil' : 'brush'
+  b.color = stroke.color
+  b.tipWidth = clamp(stroke.baseWidth * 0.55, 3, 42)
+  h.started = true
+  b.visible = true
+  setPhase(h, 'travel', dur)
+}
+
+function updatePhase(engine: StrokeEngine): void {
+  const h = engine.hand
+  const b = engine.brush
+  const u = h.dur > 0 && Number.isFinite(h.dur) ? clamp(h.t / h.dur, 0, 1) : 1
+  const stroke = engine.strokes[h.next]
+
+  switch (h.phase) {
+    case 'travel': {
+      const e = minJerk(u)
+      const dx = h.toX - h.fromX
+      const dy = h.toY - h.fromY
+      const dist = Math.hypot(dx, dy)
+      // Slight arc, as a wrist sweeps rather than slides in a straight line
+      const bulge = Math.sin(u * Math.PI) * Math.min(40, dist * 0.08)
+      const nx = dist > 0 ? -dy / dist : 0
+      const ny = dist > 0 ? dx / dist : 0
+      b.x = h.fromX + dx * e + nx * bulge
+      b.y = h.fromY + dy * e + ny * bulge
+      b.lift = lerp(h.liftFrom, 0.12, e) + Math.sin(u * Math.PI) * Math.min(0.55, dist / 450)
+      break
+    }
+    case 'down': {
+      if (!stroke) break
+      const p0 = stroke.points[0]!
+      const e = minJerk(u)
+      b.x = lerp(h.fromX, p0.x, e)
+      b.y = lerp(h.fromY, p0.y, e)
+      b.lift = lerp(0.12, 0, e)
+      break
+    }
+    case 'stroke': {
+      if (!stroke) break
+      const s = strokeEase(u) * stroke.length
+      const p = pointAt(stroke, s)
+      commitTo(engine, stroke, p.i)
+      b.x = p.x
+      b.y = p.y
+      b.lift = 0
+      h.targetAngle = handleAngleFor(strokeAngleAt(stroke, p.i), h.clock)
+      break
+    }
+    case 'lift': {
+      // Follow-through: the brush keeps moving a little as it leaves the canvas
+      const e = minJerk(u)
+      b.x = lerp(h.fromX, h.toX, e)
+      b.y = lerp(h.fromY, h.toY, e)
+      b.lift = lerp(0, 0.3, e)
+      break
+    }
+    case 'reload': {
+      b.lift = lerp(h.liftFrom, 0.95, minJerk(Math.min(1, u * 2.5)))
+      break
+    }
+    case 'idle':
+      break
+  }
+}
+
+function finishPhase(engine: StrokeEngine, target: number): void {
+  const h = engine.hand
+  const b = engine.brush
+  const stroke = engine.strokes[h.next]
+
+  switch (h.phase) {
+    case 'travel':
+      h.fromX = b.x
+      h.fromY = b.y
+      setPhase(h, 'down', stroke ? downSec(stroke) : 0.05)
+      break
+    case 'down':
+      if (stroke) beginStrokePaint(engine, stroke)
+      setPhase(h, 'stroke', stroke ? strokeSec(stroke) : 0)
+      break
+    case 'stroke': {
+      if (stroke) {
+        commitTo(engine, stroke, stroke.points.length - 1)
+        endStrokePaint(engine)
+        const a = strokeAngleAt(stroke, stroke.points.length - 2)
+        const flick = Math.min(16, 6 + stroke.baseWidth * 0.2)
+        h.fromX = b.x
+        h.fromY = b.y
+        h.toX = b.x + Math.cos(a) * flick
+        h.toY = b.y + Math.sin(a) * flick
+      }
+      engine.pathCursor = 0
+      h.next++
+      h.untilReload--
+      h.avgCycle += (h.cycleAcc - h.avgCycle) * 0.08
+      setPhase(h, 'lift', stroke ? liftSec(stroke) : 0.08)
+      break
+    }
+    case 'lift':
+    case 'reload':
+      beginNext(engine, target)
+      break
+    case 'idle':
+      break
+  }
+}
+
+/** Instantly paint strokes so the hand never falls hopelessly behind (tab switch, seek). */
+function skipAhead(engine: StrokeEngine, upTo: number): void {
+  const h = engine.hand
+  if (h.next >= upTo) return
+  const current = engine.strokes[h.next]
+  if (current && (h.phase === 'stroke' || h.phase === 'down')) {
+    if (h.phase === 'down') beginStrokePaint(engine, current)
+    commitTo(engine, current, current.points.length - 1)
+    endStrokePaint(engine)
+    h.next++
+  }
+  while (h.next < upTo) {
+    paintWholeStroke(engine, engine.strokes[h.next]!)
+    h.next++
+  }
+  const last = engine.strokes[h.next - 1]
+  if (last) {
+    const p = last.points[last.points.length - 1]!
+    engine.brush.x = p.x
+    engine.brush.y = p.y
+    engine.brush.lift = 0.3
+  }
+  setPhase(h, 'idle', Infinity)
+}
+
+/**
+ * When the hand must hurry, a painter shortens the moves between strokes far more
+ * than the strokes themselves; the lag controller absorbs the throughput difference.
+ */
+function phaseSpeed(h: Hand): number {
+  const s = h.speed
+  if (s <= 1) return s
+  return h.phase === 'stroke' ? s ** 0.6 : s ** 1.4
+}
+
+function advanceHand(engine: StrokeEngine, target: number, dtSec: number): void {
+  const h = engine.hand
+  const b = engine.brush
+  h.clock += dtSec
+
+  // How fast is the timer asking for strokes? (smoothed; timer ticks are coarse)
+  const inst = dtSec > 0 ? Math.max(0, target - h.lastTarget) / dtSec : 0
+  h.lastTarget = target
+  h.rate += (inst - h.rate) * (1 - Math.exp(-dtSec / 1.2))
+
+  const lag = target - h.next
+  if (lag > 30) skipAhead(engine, Math.floor(target) - 2)
+
+  // Match the hand's pace to the timer; drift gently so it trails ~1 stroke behind
+  const needed = h.rate * h.avgCycle
+  h.speed = clamp(Math.max(needed * (0.6 + 0.35 * Math.max(0, lag)), 0.25 * lag), 0.55, 500)
+
+  let remaining = dtSec
+  let guard = 0
+  while (remaining > 1e-6 && guard++ < 2000) {
+    if (h.phase === 'idle') {
+      if (h.next < engine.strokes.length && h.next < target) {
+        beginNext(engine, target)
+        if (h.phase === 'idle') break
+      } else {
+        break
+      }
+    }
+    const ps = phaseSpeed(h)
+    const realNeeded = (h.dur - h.t) / ps
+    if (remaining >= realNeeded) {
+      h.t = h.dur
+      remaining -= realNeeded
+    } else {
+      h.t += remaining * ps
+      remaining = 0
+    }
+    updatePhase(engine)
+    if (h.t >= h.dur - 1e-9) finishPhase(engine, target)
+  }
+
+  if (h.phase === 'idle') {
+    if (h.next >= engine.strokes.length) {
+      // Finished: hand drifts away off the canvas
+      const k = 1 - Math.exp(-dtSec * 1.5)
+      b.x = lerp(b.x, engine.width * 1.05, k)
+      b.y = lerp(b.y, engine.height * 1.2, k)
+      b.lift = lerp(b.lift, 1, k)
+      h.targetAngle = REST_ANGLE
+    } else {
+      // Hovering, waiting for the timer: a little breathing drift
+      b.lift = lerp(b.lift, 0.5, 1 - Math.exp(-dtSec * 3))
+      b.x += Math.sin(h.clock * 1.7) * 0.15
+      b.y += Math.cos(h.clock * 1.3) * 0.12
+    }
+  }
+
+  // Wrist turns smoothly instead of snapping to each segment
+  const tremor = b.lift < 0.05 ? Math.sin(h.clock * 9.3) * 0.025 + Math.sin(h.clock * 5.1) * 0.02 : 0
+  const turn = 1 - Math.exp(-dtSec * 10 * Math.min(4, Math.max(1, h.speed)))
+  b.angle += angleDiff(b.angle, h.targetAngle + tremor) * turn
+}
+
+/**
+ * The screen shows only paint: no photo is ever faded in. The wet stroke is drawn
+ * through the same path it will be committed with, so nothing pops when it lands.
+ */
+function compositeToScreen(ctx: CanvasRenderingContext2D, engine: StrokeEngine): void {
   ctx.save()
   ctx.globalAlpha = 1
   ctx.fillStyle = GESSO
   ctx.fillRect(0, 0, engine.width, engine.height)
   ctx.drawImage(engine.paintLayer, 0, 0)
-  if (settleAlpha > 0) {
-    ctx.globalAlpha = settleAlpha
-    ctx.drawImage(engine.source, 0, 0)
+  if (engine.activeStroke) renderStroke(ctx, engine, engine.activeStroke)
+  // Canvas grain shows through everything, paint included
+  if (engine.relief) {
+    ctx.globalAlpha = 1
+    ctx.fillStyle = engine.relief
+    ctx.fillRect(0, 0, engine.width, engine.height)
   }
   ctx.restore()
 }
 
 /**
  * Classic flat paintbrush.
- * Tip (wide chisel edge) sits on the canvas at (0,0); bristles gather into the ferrule; handle trails.
+ * Tip (wide chisel edge) sits at the pose point; the handle extends along `angle`.
+ * When lifted, the brush rises toward the viewer and its shadow separates from it.
  */
+/** Graphite pencil for the sketch: sharpened cone, painted hexagonal body, eraser. */
+function drawPencil(ctx: CanvasRenderingContext2D, brush: BrushPose): void {
+  const lift = clamp(brush.lift, 0, 1)
+  const bodyW = 15
+  const coneH = 26
+  const bodyH = 190
+  const ferruleH = 16
+  const eraserH = 14
+
+  // Shadow: a thin sliver touching the tip, separating as the pencil lifts
+  ctx.save()
+  ctx.translate(brush.x + lift * 14, brush.y + lift * 20)
+  ctx.rotate(brush.angle - Math.PI / 2)
+  ctx.globalAlpha = 0.2 * (1 - lift * 0.5)
+  ctx.fillStyle = 'rgb(30, 18, 10)'
+  ctx.filter = lift > 0.05 ? `blur(${(2 + lift * 5).toFixed(1)}px)` : 'blur(1px)'
+  ctx.beginPath()
+  ctx.moveTo(0, 0)
+  ctx.lineTo(bodyW * 0.5, coneH)
+  ctx.lineTo(bodyW * 0.45, coneH + bodyH + ferruleH + eraserH)
+  ctx.lineTo(-bodyW * 0.45, coneH + bodyH + ferruleH + eraserH)
+  ctx.lineTo(-bodyW * 0.5, coneH)
+  ctx.closePath()
+  ctx.fill()
+  ctx.restore()
+
+  ctx.save()
+  ctx.translate(brush.x - lift * 3, brush.y - lift * 5)
+  ctx.scale(1 + lift * 0.06, 1 + lift * 0.06)
+  ctx.rotate(brush.angle - Math.PI / 2)
+
+  // Sharpened wood cone with the graphite point
+  const wood = ctx.createLinearGradient(-bodyW / 2, 0, bodyW / 2, 0)
+  wood.addColorStop(0, '#b98a5a')
+  wood.addColorStop(0.45, '#ecc999')
+  wood.addColorStop(1, '#a8794b')
+  ctx.fillStyle = wood
+  ctx.beginPath()
+  ctx.moveTo(0, 0)
+  ctx.lineTo(bodyW / 2, coneH)
+  // Scalloped edge where the sharpener cut the paint
+  for (let i = 0; i <= 6; i++) {
+    const x = bodyW / 2 - (i * bodyW) / 6
+    ctx.lineTo(x, coneH + (i % 2 ? -2 : 0))
+  }
+  ctx.closePath()
+  ctx.fill()
+  ctx.fillStyle = '#3b3632'
+  ctx.beginPath()
+  ctx.moveTo(0, 0)
+  ctx.lineTo(bodyW * 0.17, coneH * 0.34)
+  ctx.lineTo(-bodyW * 0.17, coneH * 0.34)
+  ctx.closePath()
+  ctx.fill()
+
+  // Painted hexagonal body: three facets
+  const facets = ['#2f5d3a', '#3f7a4d', '#244a2e']
+  for (let f = 0; f < 3; f++) {
+    ctx.fillStyle = facets[f]!
+    ctx.fillRect(-bodyW / 2 + (f * bodyW) / 3, coneH, bodyW / 3 + 0.5, bodyH)
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.18)'
+  ctx.fillRect(-bodyW / 2 + bodyW / 3 + 1, coneH + 4, 2, bodyH - 8)
+
+  // Ferrule and eraser
+  const metal = ctx.createLinearGradient(-bodyW / 2, 0, bodyW / 2, 0)
+  metal.addColorStop(0, '#7d848c')
+  metal.addColorStop(0.45, '#e8ecf0')
+  metal.addColorStop(1, '#6b727a')
+  ctx.fillStyle = metal
+  ctx.fillRect(-bodyW / 2, coneH + bodyH, bodyW, ferruleH)
+  ctx.fillStyle = '#d98a8a'
+  ctx.beginPath()
+  ctx.roundRect(-bodyW / 2, coneH + bodyH + ferruleH, bodyW, eraserH, [0, 0, 4, 4])
+  ctx.fill()
+  ctx.restore()
+}
+
 export function drawBrush(ctx: CanvasRenderingContext2D, brush: BrushPose): void {
   if (!brush.visible) return
+  if (brush.tool === 'pencil') {
+    drawPencil(ctx, brush)
+    return
+  }
 
-  const s = Math.max(26, Math.min(44, brush.tipWidth * 1.25))
+  // Big flats for blocking in, small rounds for detail
+  const s = clamp(brush.tipWidth * 1.3, 15, 44)
+  const lift = clamp(brush.lift, 0, 1)
   // Tip is WIDE; ferrule end is narrower (real flat-brush silhouette)
   const tipW = s * 1.35
   const rootW = s * 0.78
@@ -451,16 +945,31 @@ export function drawBrush(ctx: CanvasRenderingContext2D, brush: BrushPose): void
   const handleTopW = ferruleW * 0.92
   const handleEndW = s * 0.32
 
+  // Shadow on the canvas: tight under the tip when touching, offset and soft when raised
   ctx.save()
-  ctx.translate(brush.x, brush.y)
-  ctx.rotate(brush.angle + Math.PI)
-  ctx.rotate(0.4)
-
-  // Soft shadow under tip
-  ctx.fillStyle = 'rgba(30, 18, 10, 0.22)'
+  ctx.translate(brush.x + lift * s * 0.55, brush.y + lift * s * 0.8)
+  ctx.rotate(brush.angle - Math.PI / 2)
+  ctx.globalAlpha = 0.22 * (1 - lift * 0.55)
+  ctx.fillStyle = 'rgb(30, 18, 10)'
+  ctx.filter = lift > 0.05 ? `blur(${(2 + lift * 6).toFixed(1)}px)` : 'none'
   ctx.beginPath()
-  ctx.ellipse(0, s * 0.06, tipW * 0.48, s * 0.14, 0, 0, Math.PI * 2)
+  ctx.ellipse(0, s * 0.1, tipW * 0.5, s * 0.16, 0, 0, Math.PI * 2)
   ctx.fill()
+  if (lift > 0.05) {
+    ctx.beginPath()
+    ctx.moveTo(-rootW * 0.45, bristleH)
+    ctx.lineTo(rootW * 0.45, bristleH)
+    ctx.lineTo(handleEndW * 0.5, bristleH + ferruleH + handleH * 0.9)
+    ctx.lineTo(-handleEndW * 0.5, bristleH + ferruleH + handleH * 0.9)
+    ctx.closePath()
+    ctx.fill()
+  }
+  ctx.restore()
+
+  ctx.save()
+  ctx.translate(brush.x - lift * s * 0.12, brush.y - lift * s * 0.2)
+  ctx.scale(1 + lift * 0.07, 1 + lift * 0.07)
+  ctx.rotate(brush.angle - Math.PI / 2)
 
   // --- Bristle block: wide at tip (y≈0), gathered at ferrule (y=bristleH) ---
   const hairGrad = ctx.createLinearGradient(0, 0, 0, bristleH)
@@ -554,7 +1063,7 @@ export function drawBrush(ctx: CanvasRenderingContext2D, brush: BrushPose): void
 }
 
 /**
- * Advance the brush toward timer progress.
+ * Advance the painter's hand toward timer progress.
  * Call every animation frame with dt (ms) for smooth motion.
  */
 export function tickPainting(
@@ -564,72 +1073,38 @@ export function tickPainting(
   dtMs: number,
 ): void {
   const clamped = Math.max(0, Math.min(1, progress))
-  const paintT = Math.min(1, clamped / 0.94)
-  const targetHead = paintStrokeIndex(paintT, engine.strokes.length)
-  const settleAlpha = clamped >= 0.94 ? (clamped - 0.94) / 0.06 : 0
+  // Every stroke is down by paintEnd; after that the finished piece stays on show
+  const paintT = Math.min(1, clamped / (engine.paintEnd ?? 0.94))
+  const target = targetIndex(engine.phases, engine.strokes.length, paintT)
 
-  // Catch up speed: strokes per second (faster if behind)
-  const behind = targetHead - engine.head
-  const baseSpeed = 14 // strokes/sec when slightly behind
-  const catchUp = Math.min(90, baseSpeed + Math.max(0, behind) * 8)
-  const step = (catchUp * dtMs) / 1000
-  const nextHead = Math.min(targetHead, engine.head + Math.max(step, behind > 0 ? 0.002 : 0))
+  advanceHand(engine, target, Math.max(0, dtMs) / 1000)
 
-  // Commit paint from engine.head → nextHead along stroke paths
-  let head = engine.head
-  while (head < nextHead && head < engine.strokes.length) {
-    const strokeIndex = Math.floor(head)
-    const stroke = engine.strokes[strokeIndex]
-    if (!stroke) break
-
-    const localEnd = Math.min(1, nextHead - strokeIndex)
-    const pts = stroke.points
-    const endIdx = Math.max(0, Math.floor(localEnd * (pts.length - 1)))
-
-    // First contact: drop a loaded tip blotch
-    if (engine.pathCursor === 0 && endIdx >= 0) {
-      const p = pts[0]!
-      engine.paintCtx.save()
-      engine.paintCtx.fillStyle = stroke.color
-      engine.paintCtx.globalAlpha = stroke.alpha
-      engine.paintCtx.beginPath()
-      engine.paintCtx.ellipse(
-        p.x,
-        p.y,
-        stroke.baseWidth * (stroke.style === 'wash' ? 0.5 : 0.28),
-        stroke.baseWidth * (stroke.style === 'wash' ? 0.34 : 0.16),
-        strokeAngleAt(stroke, 0),
-        0,
-        Math.PI * 2,
-      )
-      engine.paintCtx.fill()
-      engine.paintCtx.restore()
-    }
-
-    for (let i = engine.pathCursor + 1; i <= endIdx; i++) {
-      paintSegment(engine.paintCtx, stroke, i - 1, i)
-    }
-
-    setBrush(engine, stroke, endIdx, settleAlpha < 0.85)
-
-    if (localEnd >= 1) {
-      engine.pathCursor = 0
-      head = strokeIndex + 1
-    } else {
-      engine.pathCursor = endIdx
-      head = strokeIndex + localEnd
-      break
-    }
-  }
-
-  engine.head = Math.min(nextHead, engine.strokes.length)
-
-  if (settleAlpha >= 0.85) {
+  // Once done, the hand sets the brush down and moves out of the picture
+  const offCanvas = engine.brush.y > engine.height * 1.08
+  if ((isPaintingComplete(engine) && offCanvas) || !engine.hand.started) {
     engine.brush.visible = false
   }
 
-  compositeToScreen(ctx, engine, settleAlpha)
+  compositeToScreen(ctx, engine)
   drawBrush(ctx, engine.brush)
+}
+
+/** Every stroke is on the canvas. */
+export function isPaintingComplete(engine: StrokeEngine): boolean {
+  return engine.hand.next >= engine.strokes.length && !engine.activeStroke
+}
+
+/**
+ * How long the finished painting stays on show before the break ends. Kept within
+ * 30–60 s; very short breaks (test mode) cap it so there's still time to paint.
+ */
+export const PREVIEW_SECONDS = 45
+
+/** Fraction of the remaining break by which painting must be finished. */
+export function paintEndFor(remainingSeconds: number): number {
+  if (remainingSeconds <= 0) return 0.94
+  const show = Math.min(PREVIEW_SECONDS, remainingSeconds * 0.3)
+  return clamp(1 - show / remainingSeconds, 0.5, 0.97)
 }
 
 /** Instant jump used on setup / pause-seek. */
@@ -638,7 +1113,11 @@ export function paintToProgress(
   engine: StrokeEngine,
   progress: number,
 ): void {
-  tickPainting(ctx, engine, progress, 60_000)
+  const clamped = Math.max(0, Math.min(1, progress))
+  const target = targetIndex(engine.phases, engine.strokes.length, Math.min(1, clamped / (engine.paintEnd ?? 0.94)))
+  skipAhead(engine, Math.floor(target))
+  engine.hand.lastTarget = target
+  tickPainting(ctx, engine, progress, 16)
 }
 
 export function prepareCanvas(

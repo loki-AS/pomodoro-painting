@@ -15,6 +15,7 @@ export default function App() {
   const pomo = usePomodoro()
   const [artwork, setArtwork] = useState<Artwork | null>(null)
   const [canvasReady, setCanvasReady] = useState(false)
+  const [paintingDone, setPaintingDone] = useState(false)
   const [preloadStatus, setPreloadStatus] = useState('')
   const [error, setError] = useState('')
   const fetchGen = useRef(0)
@@ -78,7 +79,8 @@ export default function App() {
     pomo.start()
   }
 
-  const showCredit = pomo.isBreak && pomo.progress >= 0.85
+  // Credit the artist once the painting is finished and on show
+  const showCredit = pomo.isBreak && paintingDone
 
   return (
     <div className={`app ${pomo.isBreak ? 'app--break' : ''}`}>
@@ -87,8 +89,10 @@ export default function App() {
       <PaintingReveal
         artwork={artwork}
         progress={pomo.isBreak ? pomo.progress : 0}
+        durationMs={pomo.durationMs}
         active={pomo.isBreak}
         onReadyChange={setCanvasReady}
+        onCompleteChange={setPaintingDone}
       />
 
       <ArtworkCredit
@@ -128,7 +132,9 @@ export default function App() {
                   ? 'Loading canvas…'
                   : !pomo.running
                     ? 'Paused'
-                    : 'Painting…'}
+                    : paintingDone
+                      ? 'Finished'
+                      : 'Painting…'}
             </p>
           </div>
         )}

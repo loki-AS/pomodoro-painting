@@ -14,6 +14,7 @@ function breakLabel(phase: string): string {
 export default function App() {
   const pomo = usePomodoro()
   const [artwork, setArtwork] = useState<Artwork | null>(null)
+  const [canvasReady, setCanvasReady] = useState(false)
   const [preloadStatus, setPreloadStatus] = useState('')
   const [error, setError] = useState('')
   const fetchGen = useRef(0)
@@ -46,12 +47,14 @@ export default function App() {
   useEffect(() => {
     if (pomo.phase === 'focus') {
       setArtwork(null)
+      setCanvasReady(false)
       void preloadArtwork()
     }
   }, [pomo.phase, pomo.completedFocuses, preloadArtwork])
 
   useEffect(() => {
     if (pomo.isBreak && !artwork && !error) {
+      setCanvasReady(false)
       void preloadArtwork()
     }
   }, [pomo.isBreak, artwork, error, preloadArtwork])
@@ -60,10 +63,15 @@ export default function App() {
     if (pomo.phase === 'idle') {
       fetchGen.current += 1
       setArtwork(null)
+      setCanvasReady(false)
       setPreloadStatus('')
       setError('')
     }
   }, [pomo.phase])
+
+  useEffect(() => {
+    if (!pomo.isBreak) setCanvasReady(false)
+  }, [pomo.isBreak])
 
   const handleStart = () => {
     requestFullscreen()
@@ -79,10 +87,14 @@ export default function App() {
       <PaintingReveal
         artwork={artwork}
         progress={pomo.isBreak ? pomo.progress : 0}
-        active={pomo.isBreak && !!artwork}
+        active={pomo.isBreak}
+        onReadyChange={setCanvasReady}
       />
 
-      <ArtworkCredit artwork={artwork} visible={showCredit} />
+      <ArtworkCredit
+        artwork={artwork}
+        visible={showCredit && canvasReady}
+      />
 
       <main className="app__main">
         {pomo.phase === 'idle' && (
@@ -110,11 +122,13 @@ export default function App() {
               {formatTime(pomo.remainingMs)}
             </p>
             <p className="break-chrome__hint">
-              {!artwork && !error
-                ? 'Loading canvas…'
-                : pomo.running
-                  ? 'Painting…'
-                  : 'Paused'}
+              {error
+                ? 'Could not load painting'
+                : !artwork || !canvasReady
+                  ? 'Loading canvas…'
+                  : !pomo.running
+                    ? 'Paused'
+                    : 'Painting…'}
             </p>
           </div>
         )}

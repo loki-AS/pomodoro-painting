@@ -10,6 +10,11 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/met-api/, ''),
       },
+      '/met-images': {
+        target: 'https://images.metmuseum.org',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/met-images/, ''),
+      },
     },
   },
 })

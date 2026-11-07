@@ -19,7 +19,7 @@ Open the local URL Vite prints, click **Fullscreen**, then **Begin focus**.
 
 Add `?fast=1` to the URL for short demo timings (30s / 20s / 40s) while testing the brush reveal.
 
-The Met Collection API is proxied in dev via `/met-api` (see `vite.config.ts`).
+Dev proxies The Met Collection API via `/met-api` and images via `/met-images` (see `vite.config.ts`) so canvas color sampling works without CORS issues. Painting search uses Met Collection API **v1.1** (`/public/collection/v1.1/search`) with pagination.
 
 ## Build
 

@@ -20,46 +20,64 @@ type MetObject = {
   objectURL?: string
 }
 
-const MET_BASE =
-  import.meta.env.DEV
-    ? '/met-api/public/collection/v1'
-    : 'https://collectionapi.metmuseum.org/public/collection/v1'
+const MET_ORIGIN = import.meta.env.DEV
+  ? '/met-api'
+  : 'https://collectionapi.metmuseum.org'
+
+const MET_SEARCH = `${MET_ORIGIN}/public/collection/v1.1/search`
+const MET_OBJECTS = `${MET_ORIGIN}/public/collection/v1/objects`
 
 let cachedObjectIds: number[] | null = null
+
+async function searchPage(
+  filter: Record<string, string>,
+  offset: number,
+  limit: number,
+): Promise<{ total: number; ids: number[] }> {
+  const params = new URLSearchParams({
+    ...filter,
+    limit: String(limit),
+    offset: String(offset),
+  })
+  const res = await fetch(`${MET_SEARCH}?${params}`)
+  if (!res.ok) throw new Error(`Met search failed: ${res.status}`)
+  const data = (await res.json()) as {
+    total?: number
+    objectIDs?: number[] | null
+    message?: string
+  }
+  if (data.message && !data.objectIDs) throw new Error(data.message)
+  return { total: data.total ?? 0, ids: data.objectIDs ?? [] }
+}
 
 async function searchPaintingIds(): Promise<number[]> {
   if (cachedObjectIds?.length) return cachedObjectIds
 
-  const queries = [
-    new URLSearchParams({
-      q: 'painting',
-      medium: 'Paintings',
-      hasImages: 'true',
-      isPublicDomain: 'true',
-    }),
-    new URLSearchParams({
-      q: 'oil',
-      medium: 'Paintings',
-      hasImages: 'true',
-      isPublicDomain: 'true',
-    }),
-    new URLSearchParams({
-      q: 'portrait',
-      hasImages: 'true',
-      isPublicDomain: 'true',
-      departmentId: '11',
-    }),
+  const filters: Record<string, string>[] = [
+    { q: 'painting', medium: 'Paintings', hasImages: 'true', isPublicDomain: 'true' },
+    { q: 'oil on canvas', medium: 'Paintings', hasImages: 'true', isPublicDomain: 'true' },
+    { q: 'portrait', hasImages: 'true', isPublicDomain: 'true', departmentId: '11' },
   ]
 
   const idSet = new Set<number>()
-  for (const params of queries) {
+
+  for (const filter of filters) {
     try {
-      const res = await fetch(`${MET_BASE}/search?${params}`)
-      if (!res.ok) continue
-      const data = (await res.json()) as { objectIDs?: number[] | null }
-      for (const id of data.objectIDs ?? []) idSet.add(id)
+      const first = await searchPage(filter, 0, 200)
+      for (const id of first.ids) idSet.add(id)
+
+      // One extra random page for variety (v1.1 caps offset+limit at 10000)
+      const reachable = Math.min(first.total, 10000)
+      if (reachable > 200) {
+        const limit = 200
+        const pages = Math.floor(reachable / limit)
+        const pageIndex = 1 + Math.floor(Math.random() * Math.max(1, pages - 1))
+        const more = await searchPage(filter, pageIndex * limit, limit)
+        for (const id of more.ids) idSet.add(id)
+      }
+      if (idSet.size >= 150) break
     } catch {
-      // try next query
+      // try next filter
     }
   }
 
@@ -71,7 +89,7 @@ async function searchPaintingIds(): Promise<number[]> {
 }
 
 async function fetchObject(id: number): Promise<MetObject> {
-  const res = await fetch(`${MET_BASE}/objects/${id}`)
+  const res = await fetch(`${MET_OBJECTS}/${id}`)
   if (!res.ok) throw new Error(`Met object ${id} failed: ${res.status}`)
   return (await res.json()) as MetObject
 }
@@ -90,13 +108,31 @@ function toArtwork(obj: MetObject): Artwork | null {
   }
 }
 
-export function loadImage(url: string): Promise<HTMLImageElement> {
+function resolveImageUrl(url: string): string {
+  if (import.meta.env.DEV && url.startsWith('https://images.metmuseum.org')) {
+    return url.replace('https://images.metmuseum.org', '/met-images')
+  }
+  return url
+}
+
+export async function loadImage(url: string): Promise<HTMLImageElement> {
+  const resolved = resolveImageUrl(url)
+  const res = await fetch(resolved)
+  if (!res.ok) throw new Error(`Failed to fetch image: ${res.status}`)
+  const blob = await res.blob()
+  const objectUrl = URL.createObjectURL(blob)
+
   return new Promise((resolve, reject) => {
     const img = new Image()
-    img.crossOrigin = 'anonymous'
-    img.onload = () => resolve(img)
-    img.onerror = () => reject(new Error(`Failed to load image: ${url}`))
-    img.src = url
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl)
+      resolve(img)
+    }
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl)
+      reject(new Error(`Failed to load image: ${url}`))
+    }
+    img.src = objectUrl
   })
 }
 

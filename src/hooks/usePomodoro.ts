@@ -57,6 +57,7 @@ export function usePomodoro(): PomodoroState {
   const runningRef = useRef(running)
   const completedRef = useRef(completedFocuses)
   const lastTickRef = useRef<number | null>(null)
+  const advancingRef = useRef(false)
 
   phaseRef.current = phase
   remainingRef.current = remainingMs
@@ -65,6 +66,7 @@ export function usePomodoro(): PomodoroState {
 
   const enterPhase = useCallback((next: Phase) => {
     const duration = durationFor(next)
+    phaseRef.current = next
     setPhase(next)
     setDurationMs(duration)
     setRemainingMs(duration)
@@ -75,16 +77,22 @@ export function usePomodoro(): PomodoroState {
 
   const advanceFrom = useCallback(
     (current: Phase) => {
-      if (current === 'focus') {
-        const nextCount = completedRef.current + 1
-        setCompletedFocuses(nextCount)
-        completedRef.current = nextCount
-        enterPhase(nextAfterFocus(nextCount))
-        return
-      }
-      if (current === 'shortBreak' || current === 'longBreak') {
-        enterPhase('focus')
-        return
+      if (advancingRef.current) return
+      if (phaseRef.current !== current) return
+      advancingRef.current = true
+      try {
+        if (current === 'focus') {
+          const nextCount = completedRef.current + 1
+          setCompletedFocuses(nextCount)
+          completedRef.current = nextCount
+          enterPhase(nextAfterFocus(nextCount))
+          return
+        }
+        if (current === 'shortBreak' || current === 'longBreak') {
+          enterPhase('focus')
+        }
+      } finally {
+        advancingRef.current = false
       }
     },
     [enterPhase],

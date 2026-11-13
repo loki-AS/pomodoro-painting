@@ -1,0 +1,256 @@
+.studio-loader {
+  width: min(22rem, 100%);
+  margin-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  animation: idle-in 0.7s ease both;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The changing studio line: brushed in letter by letter over a dry-brush swash */
+.studio-chatter {
+  margin: 0;
+  min-height: 3.6rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-display);
+  font-size: clamp(1.25rem, 3.4vw, 1.6rem);
+  font-style: italic;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--ink);
+}
+
+.studio-chatter__line {
+  position: relative;
+  display: inline-block;
+  padding: 0.15rem 0.2rem;
+  /* Each line lingers, then drifts up and dissolves before the next; the delay is
+     set per line (StudioChatter) so the full sentence stays readable for 3s */
+  animation: chatter-out 0.45s ease-in forwards;
+  animation-delay: 2.35s;
+}
+
+.studio-chatter__ch {
+  display: inline-block;
+  opacity: 0;
+  filter: blur(6px);
+  transform: translateY(0.35em) rotate(-4deg);
+  animation: chatter-in 0.6s cubic-bezier(0.2, 0.7, 0.2, 1) forwards;
+}
+
+.studio-chatter__dots {
+  display: inline-block;
+  opacity: 0;
+  animation: chatter-in 0.4s ease forwards;
+}
+
+.studio-chatter__dots > span {
+  display: inline-block;
+  animation: chatter-dot 1.2s ease-in-out infinite;
+}
+
+.studio-chatter__dots > span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.studio-chatter__dots > span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+.studio-chatter__text {
+  position: relative;
+  z-index: 1;
+}
+
+/* Dry-brush paint laid down behind the words */
+.studio-chatter__swash {
+  position: absolute;
+  z-index: 0;
+  left: -7%;
+  top: 50%;
+  width: 114%;
+  height: 1.45em;
+  transform: translateY(-40%);
+  overflow: visible;
+  pointer-events: none;
+}
+
+.studio-chatter__swash path {
+  fill: none;
+  stroke: var(--accent);
+  stroke-linecap: round;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation-name: chatter-stroke;
+  animation-timing-function: cubic-bezier(0.45, 0.05, 0.3, 1);
+  animation-fill-mode: forwards;
+}
+
+.studio-chatter__swash-body {
+  stroke-width: 22;
+  opacity: 0.55;
+}
+
+.studio-chatter__swash-edge {
+  stroke-width: 7;
+  opacity: 0.35;
+  animation-delay: 0.12s;
+}
+
+@keyframes chatter-in {
+  to {
+    opacity: 1;
+    filter: blur(0);
+    transform: none;
+  }
+}
+
+@keyframes chatter-out {
+  to {
+    opacity: 0;
+    filter: blur(4px);
+    transform: translateY(-0.4em);
+  }
+}
+
+@keyframes chatter-stroke {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes chatter-dot {
+  0%,
+  100% {
+    transform: none;
+    opacity: 0.35;
+  }
+  40% {
+    transform: translateY(-0.18em);
+    opacity: 1;
+  }
+}
+
+.studio-loader__bar {
+  position: relative;
+  height: 3px;
+  overflow: hidden;
+  background: var(--line);
+}
+
+.studio-loader__bar > span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.4s ease;
+}
+
+/* Size not known yet: a gentle sweep instead of a number */
+.studio-loader__bar--unknown > span {
+  width: 30%;
+  animation: studio-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes studio-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+.studio-loader__steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+  text-align: left;
+}
+
+.studio-loader__step {
+  display: grid;
+  grid-template-columns: 1.1rem 1fr auto;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--ink-muted);
+}
+
+.studio-loader__step--ready .studio-loader__label {
+  color: var(--ink);
+}
+
+.studio-loader__mark {
+  display: inline-flex;
+  justify-content: center;
+  color: var(--accent-hot);
+}
+
+/* A small spinning ring while a step is still loading */
+.studio-loader__step--loading .studio-loader__mark::before {
+  content: '';
+  width: 0.7rem;
+  height: 0.7rem;
+  border: 1.5px solid var(--line);
+  border-top-color: var(--accent-hot);
+  border-radius: 50%;
+  animation: studio-spin 0.9s linear infinite;
+}
+
+@keyframes studio-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.studio-loader__detail {
+  font-variant-numeric: tabular-nums;
+}
+
+.studio-loader__note {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--ink-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .studio-loader__bar--unknown > span,
+  .studio-loader__step--loading .studio-loader__mark::before,
+  .studio-chatter__line,
+  .studio-chatter__dots > span {
+    animation: none;
+  }
+
+  .studio-chatter__ch,
+  .studio-chatter__dots {
+    animation: none;
+    opacity: 1;
+    filter: none;
+    transform: none;
+  }
+
+  .studio-chatter__swash path {
+    animation: none;
+    stroke-dashoffset: 0;
+  }
+}
+
+.studio-chatter__word {
+  white-space: nowrap;
+}

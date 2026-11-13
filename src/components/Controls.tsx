@@ -13,6 +13,8 @@ type Props = {
   narration?: { enabled: boolean; onToggle: () => void }
   /** Background music toggle; omitted when the browser can't play generated audio */
   music?: { enabled: boolean; onToggle: () => void }
+  /** Still loading: the start buttons wait */
+  disabled?: boolean
 }
 
 export function Controls({
@@ -26,14 +28,15 @@ export function Controls({
   onFullscreen,
   narration,
   music,
+  disabled = false,
 }: Props) {
   if (phase === 'idle') {
     return (
       <div className="controls">
-        <button type="button" className="btn btn--primary" onClick={onStart}>
+        <button type="button" className="btn btn--primary" onClick={onStart} disabled={disabled} aria-busy={disabled}>
           Begin focus
         </button>
-        <button type="button" className="btn btn--ghost" onClick={onFullscreen}>
+        <button type="button" className="btn btn--ghost" onClick={onFullscreen} disabled={disabled}>
           Fullscreen
         </button>
       </div>

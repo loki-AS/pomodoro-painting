@@ -2,9 +2,11 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArtworkCredit } from './components/ArtworkCredit'
 import { Controls } from './components/Controls'
 import { FocusOverlay } from './components/FocusOverlay'
+import { StudioLoader } from './components/StudioLoader'
 import { PaintingReveal, type PaintStage } from './components/PaintingReveal'
 import { useAmbientMusic } from './hooks/useAmbientMusic'
 import { useNarration } from './hooks/useNarration'
+import { useStudioReady } from './hooks/useStudioReady'
 import { formatTime, usePomodoro } from './hooks/usePomodoro'
 import { fetchRandomArtwork, type Artwork } from './lib/metApi'
 import './index.css'
@@ -15,6 +17,8 @@ function breakLabel(phase: string): string {
 
 export default function App() {
   const pomo = usePomodoro()
+  // The voice model and music engine, loaded before the first session can start
+  const studio = useStudioReady()
   const [artwork, setArtwork] = useState<Artwork | null>(null)
   const [canvasReady, setCanvasReady] = useState(false)
   const [paintingDone, setPaintingDone] = useState(false)
@@ -132,7 +136,11 @@ export default function App() {
             <p className="idle__tagline">
               Focus, then watch a Met painting appear stroke by stroke.
             </p>
-            <p className="idle__hint">25 · 5 · 15 · room display ready</p>
+            {studio.ready ? (
+              <p className="idle__hint">25 · 5 · 15 · room display ready</p>
+            ) : (
+              <StudioLoader status={studio} />
+            )}
           </div>
         )}
 
@@ -183,6 +191,7 @@ export default function App() {
           onSkip={pomo.skip}
           onStop={pomo.stop}
           onFullscreen={requestFullscreen}
+          disabled={!studio.ready}
           narration={narration.supported ? { enabled: narration.enabled, onToggle: narration.toggle } : undefined}
           music={music.supported ? { enabled: music.enabled, onToggle: music.toggle } : undefined}
         />

@@ -45,3 +45,22 @@
   border-color: var(--ink-muted);
   background: color-mix(in srgb, var(--surface) 80%, transparent);
 }
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: wait;
+}
+
+.btn:disabled:active {
+  transform: none;
+}
+
+.btn--primary:disabled:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.btn--ghost:disabled:hover {
+  border-color: var(--line);
+  background: color-mix(in srgb, var(--surface) 55%, transparent);
+}

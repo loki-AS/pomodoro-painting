@@ -10,15 +10,32 @@
 import { KokoroTTS } from 'kokoro-js'
 import type { Voice } from './voices'
 
-export type TtsRequest = { id: number; text: string; voice: Voice }
+export type TtsRequest =
+  /** Load (and warm up) the model ahead of time, reporting progress */
+  | { type: 'load'; voice: Voice }
+  | { type: 'speak'; id: number; text: string; voice: Voice }
+
 export type TtsResponse =
-  | { id: number; wav: ArrayBuffer }
-  | { id: number; error: string }
-  | { ready: string }
+  | { type: 'progress'; file: string; loaded: number; total: number }
+  /** A download attempt was abandoned (e.g. WebGPU failed): forget its progress */
+  | { type: 'reset' }
+  | { type: 'warming' }
+  | { type: 'ready'; device: string }
+  | { type: 'failed'; error: string }
+  | { type: 'audio'; id: number; wav: ArrayBuffer }
+  | { type: 'error'; id: number; error: string }
 
 const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX'
 
 declare const self: DedicatedWorkerGlobalScope
+
+const post = (msg: TtsResponse, transfer: Transferable[] = []) => self.postMessage(msg, transfer)
+
+function progress(info: { status: string; file?: string; loaded?: number; total?: number }) {
+  if (info.status === 'progress' && info.file) {
+    post({ type: 'progress', file: info.file, loaded: info.loaded ?? 0, total: info.total ?? 0 })
+  }
+}
 
 async function hasWebGpu(): Promise<boolean> {
   try {
@@ -29,36 +46,53 @@ async function hasWebGpu(): Promise<boolean> {
   }
 }
 
-async function load(): Promise<KokoroTTS> {
+async function load(voice: Voice): Promise<KokoroTTS> {
+  let tts: KokoroTTS | null = null
+  let device = 'wasm'
   if (await hasWebGpu()) {
     try {
-      const tts = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: 'fp32', device: 'webgpu' })
-      self.postMessage({ ready: 'webgpu' } satisfies TtsResponse)
-      return tts
+      tts = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: 'fp32', device: 'webgpu', progress_callback: progress })
+      device = 'webgpu'
     } catch {
-      // fall through to WebAssembly
+      post({ type: 'reset' })
     }
   }
-  const tts = await KokoroTTS.from_pretrained(MODEL_ID, { dtype: 'q8', device: 'wasm' })
-  self.postMessage({ ready: 'wasm' } satisfies TtsResponse)
+  tts ??= await KokoroTTS.from_pretrained(MODEL_ID, { dtype: 'q8', device: 'wasm', progress_callback: progress })
+  // A first short line fetches the voice and compiles the model, so the
+  // narration's first real sentence isn't slow
+  post({ type: 'warming' })
+  await tts.generate('Ready.', { voice })
+  post({ type: 'ready', device })
   return tts
 }
 
 let model: Promise<KokoroTTS> | null = null
-// One line at a time: requests are queued by the message order anyway
+// One job at a time, in the order received
 let queue: Promise<unknown> = Promise.resolve()
 
+function getModel(voice: Voice): Promise<KokoroTTS> {
+  model ??= load(voice).catch((err: unknown) => {
+    post({ type: 'failed', error: String(err) })
+    throw err
+  })
+  return model
+}
+
 self.onmessage = (e: MessageEvent<TtsRequest>) => {
-  const { id, text, voice } = e.data
+  const req = e.data
+  if (req.type === 'load') {
+    getModel(req.voice).catch(() => undefined)
+    return
+  }
+  const { id, text, voice } = req
   queue = queue.then(async () => {
     try {
-      model ??= load()
-      const tts = await model
+      const tts = await getModel(voice)
       const audio = await tts.generate(text, { voice })
       const wav = audio.toWav()
-      self.postMessage({ id, wav } satisfies TtsResponse, [wav])
+      post({ type: 'audio', id, wav }, [wav])
     } catch (err) {
-      self.postMessage({ id, error: String(err) } satisfies TtsResponse)
+      post({ type: 'error', id, error: String(err) })
     }
   })
 }

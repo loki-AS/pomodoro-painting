@@ -11,6 +11,8 @@ type Props = {
   onFullscreen: () => void
   /** Spoken commentary toggle; omitted when the browser has no speech support */
   narration?: { enabled: boolean; onToggle: () => void }
+  /** Background music toggle; omitted when the browser can't play generated audio */
+  music?: { enabled: boolean; onToggle: () => void }
 }
 
 export function Controls({
@@ -23,6 +25,7 @@ export function Controls({
   onStop,
   onFullscreen,
   narration,
+  music,
 }: Props) {
   if (phase === 'idle') {
     return (
@@ -63,6 +66,17 @@ export function Controls({
           onClick={narration.onToggle}
         >
           {narration.enabled ? 'Narration on' : 'Narration off'}
+        </button>
+      )}
+      {music && (
+        <button
+          type="button"
+          className="btn btn--ghost"
+          aria-pressed={music.enabled}
+          title={music.enabled ? 'Turn off background music' : 'Turn on background music'}
+          onClick={music.onToggle}
+        >
+          {music.enabled ? 'Music on' : 'Music off'}
         </button>
       )}
     </div>

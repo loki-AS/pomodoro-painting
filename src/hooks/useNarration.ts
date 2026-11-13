@@ -74,9 +74,14 @@ export function useNarration({ artwork, active, running, stage }: Options) {
   const [script, setScript] = useState<{ id: number; lines: NarrationScript } | null>(null)
   const narratorRef = useRef<Narrator | null>(null)
   const spokenRef = useRef(new Set<NarrationCue>())
+  /** The narrator is talking right now (the music dips under it) */
+  const [speaking, setSpeaking] = useState(false)
 
   const narrator = useCallback(() => {
-    narratorRef.current ??= new Narrator()
+    if (!narratorRef.current) {
+      narratorRef.current = new Narrator()
+      narratorRef.current.onSpeakingChange = setSpeaking
+    }
     return narratorRef.current
   }, [])
 
@@ -145,5 +150,5 @@ export function useNarration({ artwork, active, running, stage }: Options) {
     })
   }, [])
 
-  return { supported, enabled, toggle }
+  return { supported, enabled, toggle, speaking }
 }

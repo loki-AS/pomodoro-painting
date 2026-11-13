@@ -3,6 +3,7 @@ import { ArtworkCredit } from './components/ArtworkCredit'
 import { Controls } from './components/Controls'
 import { FocusOverlay } from './components/FocusOverlay'
 import { PaintingReveal, type PaintStage } from './components/PaintingReveal'
+import { useAmbientMusic } from './hooks/useAmbientMusic'
 import { useNarration } from './hooks/useNarration'
 import { formatTime, usePomodoro } from './hooks/usePomodoro'
 import { fetchRandomArtwork, type Artwork } from './lib/metApi'
@@ -26,6 +27,13 @@ export default function App() {
     active: pomo.isBreak,
     running: pomo.running,
     stage: paintStage,
+  })
+  // Soft background music under the painting, dipping when the narrator speaks
+  const music = useAmbientMusic({
+    active: pomo.isBreak,
+    running: pomo.running,
+    stage: paintStage,
+    speaking: narration.speaking,
   })
   const fetchGen = useRef(0)
 
@@ -176,6 +184,7 @@ export default function App() {
           onStop={pomo.stop}
           onFullscreen={requestFullscreen}
           narration={narration.supported ? { enabled: narration.enabled, onToggle: narration.toggle } : undefined}
+          music={music.supported ? { enabled: music.enabled, onToggle: music.toggle } : undefined}
         />
       </footer>
     </div>

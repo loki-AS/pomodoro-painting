@@ -14,6 +14,8 @@ const VOICE: Voice = isVoice(__NARRATION_VOICE__) ? __NARRATION_VOICE__ : DEFAUL
 let worker: Worker | null = null
 /** Once the model has failed to load or run, stop trying for this page */
 let broken = false
+/** The model has loaded and is rendering lines */
+let ready = false
 let nextId = 1
 const waiting = new Map<number, (wav: ArrayBuffer | null) => void>()
 
@@ -29,6 +31,7 @@ function getWorker(): Worker | null {
   worker.onmessage = (e: MessageEvent<TtsResponse>) => {
     const msg = e.data
     if ('ready' in msg) {
+      ready = true
       if (import.meta.env.DEV) console.info(`[tts] Kokoro ready in the browser (${msg.ready}, voice ${VOICE})`)
       return
     }
@@ -60,4 +63,9 @@ export function synthesize(text: string): Promise<Blob | null> {
     waiting.set(id, (wav) => resolve(wav ? new Blob([wav], { type: 'audio/wav' }) : null))
     w.postMessage({ id, text, voice: VOICE } satisfies TtsRequest)
   })
+}
+
+/** True once the voice model has loaded, so a clip in progress is worth waiting for */
+export function voiceReady(): boolean {
+  return ready && !broken
 }

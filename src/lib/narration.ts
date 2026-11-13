@@ -7,7 +7,7 @@
  * by Kokoro running in the browser, with the browser's built-in voice as fallback.
  */
 import type { Artwork } from './metApi'
-import { synthesize } from './speech'
+import { synthesize, voiceReady } from './speech'
 
 /** Moments in the painting where the narrator speaks */
 export type NarrationCue = 'opening' | 'context' | 'story' | 'artist' | 'closing'
@@ -247,6 +247,15 @@ export class Narrator {
   private audio: HTMLAudioElement | null = null
   /** Bumped by clearClips() so an in-flight prepare() stops adding stale clips */
   private generation = 0
+  /** Told when the voice starts and stops (between lines, not between sentences) */
+  onSpeakingChange: ((speaking: boolean) => void) | null = null
+  private voiceOn = false
+
+  private setVoiceOn(on: boolean): void {
+    if (on === this.voiceOn) return
+    this.voiceOn = on
+    this.onSpeakingChange?.(on)
+  }
 
   constructor() {
     if (!speechSupported()) return
@@ -312,6 +321,7 @@ export class Narrator {
   pause(): void {
     if (this.paused) return
     this.paused = true
+    this.setVoiceOn(false)
     if (!this.speaking) return
     if (this.audio) {
       // A clip pauses mid-sentence and picks up where it left off
@@ -331,6 +341,7 @@ export class Narrator {
     if (!this.paused) return
     this.paused = false
     if (this.speaking && this.audio) {
+      this.setVoiceOn(true)
       void this.audio.play().catch(() => this.finishSentence())
       return
     }
@@ -340,6 +351,7 @@ export class Narrator {
   stop(): void {
     this.queue = []
     this.speaking = false
+    this.setVoiceOn(false)
     if (this.audio) {
       this.audio.pause()
       this.audio = null
@@ -360,6 +372,7 @@ export class Narrator {
   }
 
   private next(): void {
+    if (!this.speaking && !this.paused && !this.queue.length) this.setVoiceOn(false)
     if (this.speaking || this.paused || !this.queue.length) return
     const sentence = this.queue[0]!
 
@@ -374,6 +387,7 @@ export class Narrator {
       }
       this.audio = audio
       this.speaking = true
+      this.setVoiceOn(true)
       // If playback is refused, move on rather than stall the narration
       void audio.play().catch(() => {
         if (this.audio === audio) this.finishSentence()
@@ -382,8 +396,9 @@ export class Narrator {
     }
 
     // Its clip is still rendering: wait for it (up to a few seconds) rather than
-    // switch voices mid-narration
-    if (this.rendering.has(sentence)) {
+    // switch voices mid-narration. While the model is still downloading (first
+    // visit), don't wait: use the browser voice straight away
+    if (this.rendering.has(sentence) && voiceReady()) {
       this.speaking = true
       let settled = false
       const go = () => {
@@ -424,6 +439,7 @@ export class Narrator {
     u.onend = done
     u.onerror = done
     this.speaking = true
+    this.setVoiceOn(true)
     try {
       window.speechSynthesis.speak(u)
     } catch (err) {

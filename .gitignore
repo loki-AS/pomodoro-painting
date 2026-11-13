@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local secrets (e.g. ANTHROPIC_API_KEY) — never commit
+.env
+.env.*
+!.env.example

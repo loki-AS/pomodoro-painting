@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArtworkCredit } from './components/ArtworkCredit'
 import { Controls } from './components/Controls'
 import { FocusOverlay } from './components/FocusOverlay'
-import { PaintingReveal } from './components/PaintingReveal'
+import { PaintingReveal, type PaintStage } from './components/PaintingReveal'
+import { useNarration } from './hooks/useNarration'
 import { formatTime, usePomodoro } from './hooks/usePomodoro'
 import { fetchRandomArtwork, type Artwork } from './lib/metApi'
 import './index.css'
@@ -16,8 +17,16 @@ export default function App() {
   const [artwork, setArtwork] = useState<Artwork | null>(null)
   const [canvasReady, setCanvasReady] = useState(false)
   const [paintingDone, setPaintingDone] = useState(false)
+  const [paintStage, setPaintStage] = useState<PaintStage>(null)
   const [preloadStatus, setPreloadStatus] = useState('')
   const [error, setError] = useState('')
+  // Spoken commentary about the artwork while it is painted
+  const narration = useNarration({
+    artwork,
+    active: pomo.isBreak,
+    running: pomo.running,
+    stage: paintStage,
+  })
   const fetchGen = useRef(0)
 
   const requestFullscreen = useCallback(() => {
@@ -94,6 +103,7 @@ export default function App() {
         active={pomo.isBreak}
         onReadyChange={setCanvasReady}
         onCompleteChange={setPaintingDone}
+        onStageChange={setPaintStage}
       />
 
       <ArtworkCredit
@@ -165,6 +175,7 @@ export default function App() {
           onSkip={pomo.skip}
           onStop={pomo.stop}
           onFullscreen={requestFullscreen}
+          narration={narration.supported ? { enabled: narration.enabled, onToggle: narration.toggle } : undefined}
         />
       </footer>
     </div>

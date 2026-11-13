@@ -7,6 +7,15 @@ export type Artwork = {
   date: string
   imageUrl: string
   objectURL: string
+  /** Extra catalogue details, used for the spoken narration */
+  medium: string
+  department: string
+  culture: string
+  period: string
+  /** e.g. "Dutch, Zundert 1853–1890 Auvers-sur-Oise" */
+  artistBio: string
+  objectWikidataUrl: string
+  artistWikidataUrl: string
 }
 
 type MetObject = {
@@ -18,6 +27,13 @@ type MetObject = {
   primaryImageSmall?: string
   isPublicDomain?: boolean
   objectURL?: string
+  medium?: string
+  department?: string
+  culture?: string
+  period?: string
+  artistDisplayBio?: string
+  objectWikidata_URL?: string
+  artistWikidata_URL?: string
 }
 
 const MET_ORIGIN = import.meta.env.DEV
@@ -105,6 +121,13 @@ function toArtwork(obj: MetObject): Artwork | null {
     date: obj.objectDate?.trim() || '',
     imageUrl,
     objectURL: obj.objectURL ?? '',
+    medium: obj.medium?.trim() ?? '',
+    department: obj.department?.trim() ?? '',
+    culture: obj.culture?.trim() ?? '',
+    period: obj.period?.trim() ?? '',
+    artistBio: obj.artistDisplayBio?.trim() ?? '',
+    objectWikidataUrl: obj.objectWikidata_URL?.trim() ?? '',
+    artistWikidataUrl: obj.artistWikidata_URL?.trim() ?? '',
   }
 }
 

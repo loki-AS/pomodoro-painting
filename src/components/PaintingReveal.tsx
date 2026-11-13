@@ -9,7 +9,11 @@ import {
   tickPainting,
   type StrokeEngine,
 } from '../lib/strokeEngine'
+import type { LayerKind } from '../lib/paintPlan'
 import './PaintingReveal.css'
+
+/** What the painter is doing right now (null before the brush starts) */
+export type PaintStage = LayerKind | 'complete' | null
 
 /** Brief pause on blank gesso after load so the canvas is visible before the brush moves. */
 const READY_HOLD_MS = 500
@@ -28,6 +32,8 @@ type Props = {
   onReadyChange?: (ready: boolean) => void
   /** Fires true once the last stroke is down (the finished piece is now on show) */
   onCompleteChange?: (complete: boolean) => void
+  /** Fires when the painting moves to a new stage (sketch, tone, … , complete) */
+  onStageChange?: (stage: PaintStage) => void
 }
 
 function remapProgress(progress: number, origin: number): number {
@@ -43,6 +49,7 @@ export function PaintingReveal({
   active,
   onReadyChange,
   onCompleteChange,
+  onStageChange,
 }: Props) {
   const durationRef = useRef(durationMs)
   const breakMsRef = useRef(breakMs)
@@ -62,6 +69,9 @@ export function PaintingReveal({
   const onReadyRef = useRef(onReadyChange)
   const onCompleteRef = useRef(onCompleteChange)
   const completeRef = useRef(false)
+  const onStageRef = useRef(onStageChange)
+  const stageRef = useRef<PaintStage>(null)
+  onStageRef.current = onStageChange
   progressRef.current = progress
   onReadyRef.current = onReadyChange
   onCompleteRef.current = onCompleteChange
@@ -113,6 +123,8 @@ export function PaintingReveal({
     // A new canvas (or no canvas) is never a finished painting
     completeRef.current = false
     onCompleteRef.current?.(false)
+    stageRef.current = null
+    onStageRef.current?.(null)
     readyForIdRef.current = null
     originRef.current = 0
     paintAllowedRef.current = false
@@ -183,6 +195,11 @@ export function PaintingReveal({
         if (done !== completeRef.current) {
           completeRef.current = done
           onCompleteRef.current?.(done)
+        }
+        const stage: PaintStage = done ? 'complete' : (engine.strokes[engine.hand.next]?.kind ?? null)
+        if (stage !== stageRef.current) {
+          stageRef.current = stage
+          onStageRef.current?.(stage)
         }
       } else {
         last = now

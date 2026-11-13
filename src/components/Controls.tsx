@@ -9,6 +9,8 @@ type Props = {
   onSkip: () => void
   onStop: () => void
   onFullscreen: () => void
+  /** Spoken commentary toggle; omitted when the browser has no speech support */
+  narration?: { enabled: boolean; onToggle: () => void }
 }
 
 export function Controls({
@@ -20,6 +22,7 @@ export function Controls({
   onSkip,
   onStop,
   onFullscreen,
+  narration,
 }: Props) {
   if (phase === 'idle') {
     return (
@@ -51,6 +54,17 @@ export function Controls({
       <button type="button" className="btn btn--ghost" onClick={onStop}>
         Stop
       </button>
+      {narration && (
+        <button
+          type="button"
+          className="btn btn--ghost"
+          aria-pressed={narration.enabled}
+          title={narration.enabled ? 'Turn off spoken commentary' : 'Turn on spoken commentary'}
+          onClick={narration.onToggle}
+        >
+          {narration.enabled ? 'Narration on' : 'Narration off'}
+        </button>
+      )}
     </div>
   )
 }

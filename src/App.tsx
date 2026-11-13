@@ -6,6 +6,7 @@ import { StudioLoader } from './components/StudioLoader'
 import { PaintingReveal, type PaintStage } from './components/PaintingReveal'
 import { useAmbientMusic } from './hooks/useAmbientMusic'
 import { useNarration } from './hooks/useNarration'
+import { usePauseWhenHidden } from './hooks/usePauseWhenHidden'
 import { useStudioReady } from './hooks/useStudioReady'
 import { formatTime, usePomodoro } from './hooks/usePomodoro'
 import { fetchRandomArtwork, type Artwork } from './lib/metApi'
@@ -38,6 +39,13 @@ export default function App() {
     running: pomo.running,
     stage: paintStage,
     speaking: narration.speaking,
+  })
+  // The painting only runs while someone can see it
+  usePauseWhenHidden({
+    active: pomo.isBreak,
+    running: pomo.running,
+    pause: pomo.pause,
+    resume: pomo.resume,
   })
   const fetchGen = useRef(0)
 
@@ -113,6 +121,7 @@ export default function App() {
         durationMs={pomo.durationMs}
         breakMs={pomo.upcomingBreakMs}
         active={pomo.isBreak}
+        paused={pomo.isBreak && !pomo.running}
         onReadyChange={setCanvasReady}
         onCompleteChange={setPaintingDone}
         onStageChange={setPaintStage}

@@ -29,6 +29,8 @@ type Props = {
    */
   breakMs?: number
   active: boolean
+  /** The timer is paused: the brush stops where it is (it doesn't catch up) */
+  paused?: boolean
   onReadyChange?: (ready: boolean) => void
   /** Fires true once the last stroke is down (the finished piece is now on show) */
   onCompleteChange?: (complete: boolean) => void
@@ -47,10 +49,13 @@ export function PaintingReveal({
   durationMs,
   breakMs,
   active,
+  paused = false,
   onReadyChange,
   onCompleteChange,
   onStageChange,
 }: Props) {
+  const pausedRef = useRef(paused)
+  pausedRef.current = paused
   const durationRef = useRef(durationMs)
   const breakMsRef = useRef(breakMs)
   durationRef.current = durationMs
@@ -171,7 +176,8 @@ export function PaintingReveal({
       const ready = objectID !== null && !!engine && !!ctx && readyForIdRef.current === objectID
 
       if (ready) {
-        const dt = Math.min(50, now - last)
+        // Paused: no time passes for the hand, so it holds still mid-stroke
+        const dt = pausedRef.current ? 0 : Math.min(50, now - last)
         last = now
 
         if (!paintAllowedRef.current) {

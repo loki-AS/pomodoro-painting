@@ -793,6 +793,8 @@ function phaseSpeed(h: Hand): number {
 }
 
 function advanceHand(engine: StrokeEngine, target: number, dtSec: number): void {
+  // No time passing (paused): the hand holds exactly where it is
+  if (dtSec <= 0) return
   const h = engine.hand
   const b = engine.brush
   h.clock += dtSec
